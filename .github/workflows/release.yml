@@ -29,6 +29,11 @@ on:
         required: false
         type: boolean
         default: false
+      force_release:
+        description: 'Force a release even if version exists'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
