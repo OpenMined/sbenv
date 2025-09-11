@@ -667,7 +667,7 @@ fn install_shell_functions() -> Result<()> {
 fn check_login_status(config_path: &Path) -> Result<bool> {
     // Check if refresh_token exists in config
     let config = load_config(config_path)?;
-    
+
     // If there's a refresh token, assume we're logged in
     // The daemon will fail if the token is invalid, and we'll handle that
     Ok(config.refresh_token.is_some())
