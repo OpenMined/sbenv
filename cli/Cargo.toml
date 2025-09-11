@@ -7,6 +7,7 @@ description = "SyftBox Env - virtualenv for SyftBox"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/openmined/sbenv"
 homepage = "https://github.com/openmined/sbenv"
+documentation = "https://github.com/openmined/sbenv"
 readme = "README.md"
 keywords = ["syftbox", "virtualenv", "environment", "cli"]
 categories = ["command-line-utilities", "development-tools"]
