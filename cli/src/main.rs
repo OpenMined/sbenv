@@ -94,6 +94,9 @@ enum Commands {
         /// Skip login check
         #[arg(long)]
         skip_login_check: bool,
+        /// Run syftbox in daemon mode (background). By default off; process is still backgrounded.
+        #[arg(long, default_value_t = false)]
+        daemon: bool,
     },
     /// Stop the running SyftBox daemon
     Stop,
@@ -902,7 +905,7 @@ fn prompt_and_login(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
+fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let config_path = find_syftbox_config(&current_dir)
         .ok_or_else(|| anyhow::anyhow!("No SyftBox environment found. Run 'sbenv init' first."))?;
@@ -915,8 +918,8 @@ fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
     let pid_file = syftbox_dir.join("syftbox.pid");
     let log_file = syftbox_dir.join("daemon.log");
 
-    // Check if already running
-    if !force && pid_file.exists() {
+    // Check if already running (only relevant for daemon mode)
+    if daemon && !force && pid_file.exists() {
         if let Ok(pid_str) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = pid_str.trim().parse::<u32>() {
                 // Check if process is actually running
@@ -944,20 +947,24 @@ fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
         config = load_config(&config_path)?;
     }
 
-    // Parse HTTP address from client URL
     // Prepare args and optionally set http addr if client_url is present
-    let mut syftbox_args: Vec<String> = vec![
-        "-c".into(),
-        config_path.to_str().unwrap().into(),
-        "daemon".into(),
-    ];
-    if let Some(url) = &config.client_url {
-        let http_addr_owned = url.strip_prefix("http://").unwrap_or(url).to_string();
-        syftbox_args.push("--http-addr".into());
-        syftbox_args.push(http_addr_owned);
+    let mut syftbox_args: Vec<String> = vec!["-c".into(), config_path.to_str().unwrap().into()];
+    if daemon {
+        syftbox_args.push("daemon".into());
+    }
+    if daemon {
+        if let Some(url) = &config.client_url {
+            let http_addr_owned = url.strip_prefix("http://").unwrap_or(url).to_string();
+            syftbox_args.push("--http-addr".into());
+            syftbox_args.push(http_addr_owned);
+        }
     }
 
-    println!("{}", "Starting SyftBox daemon...".green());
+    if daemon {
+        println!("{}", "Starting SyftBox daemon (background)...".green());
+    } else {
+        println!("{}", "Starting SyftBox (background)...".green());
+    }
     println!("  Email: {}", config.email.cyan());
     println!(
         "  Client URL: {}",
@@ -966,7 +973,7 @@ fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
     println!("  Data dir: {}", config.data_dir.cyan());
     println!("  Config: {}", config_path.display().to_string().cyan());
 
-    // Create log file
+    // Create log file (both modes use the same log so 'sbenv logs' works)
     let log = fs::File::create(&log_file)?;
 
     // WORKAROUND: Temporarily rename global config if it exists
@@ -989,15 +996,17 @@ fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
         restored_home_config = true;
     }
 
-    // Start daemon process with -c flag and environment variables
-    let child = Command::new("syftbox")
+    // Background execution using nohup for both modes; write output to log file
+    let child = Command::new("nohup")
+        .arg("syftbox")
         .args(&syftbox_args)
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
+        .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()
-        .context("Failed to start syftbox daemon. Is 'syftbox' installed?")?;
+        .context("Failed to start syftbox in background. Is 'syftbox' installed?")?;
 
     let pid = child.id();
 
@@ -1018,10 +1027,14 @@ fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
     }
 
     if check.status.success() {
-        println!(
-            "{}",
-            "✅ SyftBox daemon started successfully!".green().bold()
-        );
+        if daemon {
+            println!(
+                "{}",
+                "✅ SyftBox daemon started successfully!".green().bold()
+            );
+        } else {
+            println!("{}", "✅ SyftBox started in background".green().bold());
+        }
         println!("  PID: {}", pid.to_string().cyan());
         println!("  Logs: {}", "sbenv logs".yellow());
         println!("  Status: {}", "sbenv status".yellow());
@@ -1238,7 +1251,7 @@ fn restart_daemon() -> Result<()> {
     thread::sleep(Duration::from_secs(1));
 
     // Start again
-    start_daemon(false, false)
+    start_daemon(false, false, true)
 }
 
 fn restore_config_after_login(config_path: &Path, original_config: &SyftBoxConfig) -> Result<()> {
@@ -1382,8 +1395,9 @@ fn main() -> Result<()> {
         Some(Commands::Start {
             force,
             skip_login_check,
+            daemon,
         }) => {
-            start_daemon(*force, *skip_login_check)?;
+            start_daemon(*force, *skip_login_check, *daemon)?;
         }
         Some(Commands::Stop) => {
             stop_daemon()?;
