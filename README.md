@@ -97,8 +97,6 @@ sbd
 # Create a new environment
 sbenv create <name>
 
-# List all environments
-sbenv list
 
 # Remove an environment
 sbenv remove <name>
