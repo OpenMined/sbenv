@@ -4,6 +4,7 @@ use colored::*;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -20,6 +21,19 @@ struct SyftBoxConfig {
     client_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EnvRegistry {
+    environments: HashMap<String, EnvInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct EnvInfo {
+    path: String,
+    email: String,
+    port: u16,
+    name: String,
 }
 
 #[derive(Parser)]
@@ -95,6 +109,93 @@ enum Commands {
     },
     /// Login to SyftBox
     Login,
+    /// List all SyftBox environments
+    List,
+}
+
+fn get_registry_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".sbenv").join("envs.json")
+}
+
+fn load_registry() -> Result<EnvRegistry> {
+    let registry_path = get_registry_path();
+    if !registry_path.exists() {
+        return Ok(EnvRegistry {
+            environments: HashMap::new(),
+        });
+    }
+    let content = fs::read_to_string(&registry_path)?;
+    let registry: EnvRegistry = serde_json::from_str(&content)?;
+    Ok(registry)
+}
+
+fn save_registry(registry: &EnvRegistry) -> Result<()> {
+    let registry_path = get_registry_path();
+    if let Some(parent) = registry_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(&registry)?;
+    fs::write(&registry_path, content)?;
+    Ok(())
+}
+
+fn get_used_ports() -> Result<Vec<u16>> {
+    let registry = load_registry()?;
+    Ok(registry.environments.values().map(|e| e.port).collect())
+}
+
+fn find_available_port() -> Result<u16> {
+    let used_ports = get_used_ports()?;
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..100 {
+        let port = rng.gen_range(7939..=7999);
+        if !used_ports.contains(&port) {
+            return Ok(port);
+        }
+    }
+
+    Err(anyhow::anyhow!("No available ports in range 7939-7999"))
+}
+
+fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
+    let mut registry = load_registry()?;
+
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let port = config
+        .client_url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let env_info = EnvInfo {
+        path: path.to_string_lossy().to_string(),
+        email: config.email.clone(),
+        port,
+        name: name.clone(),
+    };
+
+    registry.environments.insert(name, env_info);
+    save_registry(&registry)?;
+    Ok(())
+}
+
+fn unregister_environment(path: &Path) -> Result<()> {
+    let mut registry = load_registry()?;
+    let path_str = path.to_string_lossy().to_string();
+
+    registry
+        .environments
+        .retain(|_, info| info.path != path_str);
+    save_registry(&registry)?;
+    Ok(())
 }
 
 fn find_syftbox_config(start_dir: &Path) -> Option<PathBuf> {
@@ -140,8 +241,7 @@ fn init_environment(email: Option<String>, server_url: String) -> Result<()> {
             .context("Failed to read email input")?
     };
 
-    let mut rng = rand::thread_rng();
-    let port = rng.gen_range(7939..=7999);
+    let port = find_available_port().context("Failed to find available port")?;
     let client_url = format!("http://127.0.0.1:{}", port);
 
     let config = SyftBoxConfig {
@@ -158,6 +258,8 @@ fn init_environment(email: Option<String>, server_url: String) -> Result<()> {
     let config_json =
         serde_json::to_string_pretty(&config).context("Failed to serialize config")?;
     fs::write(&config_path, config_json).context("Failed to write config file")?;
+
+    register_environment(&current_dir, &config)?;
 
     println!("{}", "✅ SyftBox environment initialized!".green().bold());
     println!();
@@ -182,6 +284,10 @@ fn show_info() -> Result<()> {
     })?;
 
     let config = load_config(&config_path)?;
+
+    // Register the environment if not already registered
+    let env_dir = config_path.parent().unwrap().parent().unwrap();
+    let _ = register_environment(env_dir, &config);
 
     let port = config.client_url.rsplit(':').next().unwrap_or("unknown");
 
@@ -348,6 +454,7 @@ fn remove_environment(path: Option<PathBuf>) -> Result<()> {
             .context("Failed to read confirmation")?;
 
         if confirmation {
+            unregister_environment(&target_path)?;
             fs::remove_dir_all(&syftbox_dir).context("Failed to remove .syftbox directory")?;
             println!("{}", "✅ SyftBox environment removed".green());
         } else {
@@ -1077,6 +1184,32 @@ fn login_to_syftbox() -> Result<()> {
     Ok(())
 }
 
+fn list_environments() -> Result<()> {
+    let registry = load_registry()?;
+
+    if registry.environments.is_empty() {
+        println!("{}", "No SyftBox environments registered yet.".yellow());
+        println!("Use {} to create one.", "sbenv init".cyan());
+        return Ok(());
+    }
+
+    println!("{}", "📦 SyftBox Environments".bold());
+    println!();
+
+    for (name, info) in &registry.environments {
+        let path = Path::new(&info.path);
+        let exists = path.join(".syftbox").exists();
+        let status = if exists { "✅".green() } else { "❌".red() };
+
+        println!("  {} {} ({})", status, name.cyan(), info.email);
+        println!("     Path: {}", info.path);
+        println!("     Port: {}", info.port);
+        println!();
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1135,6 +1268,9 @@ fn main() -> Result<()> {
         Some(Commands::Login) => {
             login_to_syftbox()?;
         }
+        Some(Commands::List) => {
+            list_environments()?;
+        }
         None => {
             if env::var("SYFTBOX_ENV_ACTIVE").is_ok() {
                 show_info()?;
@@ -1172,4 +1308,247 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // Use a mutex to ensure tests that modify HOME don't run concurrently
+    static HOME_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_find_available_port_with_empty_registry() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        // Create a temporary directory for testing
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = env::var("HOME").ok();
+        env::set_var("HOME", temp_dir.path());
+
+        // Test finding a port when registry is empty
+        let port = find_available_port().unwrap();
+        assert!(port >= 7939 && port <= 7999);
+
+        // Restore original HOME
+        if let Some(home) = original_home {
+            env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn test_find_available_port_with_used_ports() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = env::var("HOME").ok();
+        env::set_var("HOME", temp_dir.path());
+
+        // Create a registry with some used ports
+        let mut registry = EnvRegistry {
+            environments: HashMap::new(),
+        };
+
+        // Add environments with specific ports
+        for i in 0..5 {
+            let env_info = EnvInfo {
+                path: format!("/test/path{}", i),
+                email: format!("test{}@example.com", i),
+                port: 7940 + i as u16,
+                name: format!("test{}", i),
+            };
+            registry.environments.insert(format!("test{}", i), env_info);
+        }
+
+        save_registry(&registry).unwrap();
+
+        // Find an available port
+        let port = find_available_port().unwrap();
+
+        // Verify the port is in range and not in the used ports
+        assert!(port >= 7939 && port <= 7999);
+        let used_ports: Vec<u16> = (7940..7945).collect();
+        assert!(!used_ports.contains(&port));
+
+        if let Some(home) = original_home {
+            env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn test_register_and_unregister_environment() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = env::var("HOME").ok();
+        env::set_var("HOME", temp_dir.path());
+
+        let test_path = temp_dir.path().join("test_env");
+        fs::create_dir(&test_path).unwrap();
+
+        let config = SyftBoxConfig {
+            data_dir: test_path.to_string_lossy().to_string(),
+            email: "test@example.com".to_string(),
+            server_url: "https://test.server".to_string(),
+            client_url: "http://127.0.0.1:7950".to_string(),
+            refresh_token: None,
+        };
+
+        // Register environment
+        register_environment(&test_path, &config).unwrap();
+
+        // Verify it was registered
+        let registry = load_registry().unwrap();
+        assert!(registry.environments.contains_key("test_env"));
+        let env_info = registry.environments.get("test_env").unwrap();
+        assert_eq!(env_info.email, "test@example.com");
+        assert_eq!(env_info.port, 7950);
+
+        // Unregister environment
+        unregister_environment(&test_path).unwrap();
+
+        // Verify it was removed
+        let registry = load_registry().unwrap();
+        assert!(!registry.environments.contains_key("test_env"));
+
+        if let Some(home) = original_home {
+            env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn test_load_registry_creates_empty_if_not_exists() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = env::var("HOME").ok();
+        env::set_var("HOME", temp_dir.path());
+
+        // Load registry when it doesn't exist
+        let registry = load_registry().unwrap();
+        assert!(registry.environments.is_empty());
+
+        if let Some(home) = original_home {
+            env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn test_get_used_ports() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = env::var("HOME").ok();
+        env::set_var("HOME", temp_dir.path());
+
+        let mut registry = EnvRegistry {
+            environments: HashMap::new(),
+        };
+
+        // Add test environments
+        registry.environments.insert(
+            "env1".to_string(),
+            EnvInfo {
+                path: "/path1".to_string(),
+                email: "test1@example.com".to_string(),
+                port: 7940,
+                name: "env1".to_string(),
+            },
+        );
+        registry.environments.insert(
+            "env2".to_string(),
+            EnvInfo {
+                path: "/path2".to_string(),
+                email: "test2@example.com".to_string(),
+                port: 7945,
+                name: "env2".to_string(),
+            },
+        );
+
+        save_registry(&registry).unwrap();
+
+        // Get used ports
+        let used_ports = get_used_ports().unwrap();
+        assert_eq!(used_ports.len(), 2);
+        assert!(used_ports.contains(&7940));
+        assert!(used_ports.contains(&7945));
+
+        if let Some(home) = original_home {
+            env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn test_parse_port_from_client_url() {
+        let config = SyftBoxConfig {
+            data_dir: "/test".to_string(),
+            email: "test@example.com".to_string(),
+            server_url: "https://test.server".to_string(),
+            client_url: "http://127.0.0.1:7950".to_string(),
+            refresh_token: None,
+        };
+
+        let port = config
+            .client_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap();
+
+        assert_eq!(port, 7950);
+    }
+
+    #[test]
+    fn test_parse_port_from_localhost_url() {
+        let config = SyftBoxConfig {
+            data_dir: "/test".to_string(),
+            email: "test@example.com".to_string(),
+            server_url: "https://test.server".to_string(),
+            client_url: "http://localhost:8080".to_string(),
+            refresh_token: None,
+        };
+
+        let port = config
+            .client_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap();
+
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_registry_persistence() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = env::var("HOME").ok();
+        env::set_var("HOME", temp_dir.path());
+
+        // Create and save a registry
+        let mut registry = EnvRegistry {
+            environments: HashMap::new(),
+        };
+        registry.environments.insert(
+            "persistent_env".to_string(),
+            EnvInfo {
+                path: "/persistent/path".to_string(),
+                email: "persist@example.com".to_string(),
+                port: 7960,
+                name: "persistent_env".to_string(),
+            },
+        );
+        save_registry(&registry).unwrap();
+
+        // Load it back and verify
+        let loaded = load_registry().unwrap();
+        assert_eq!(loaded.environments.len(), 1);
+        assert!(loaded.environments.contains_key("persistent_env"));
+
+        let env = loaded.environments.get("persistent_env").unwrap();
+        assert_eq!(env.email, "persist@example.com");
+        assert_eq!(env.port, 7960);
+
+        if let Some(home) = original_home {
+            env::set_var("HOME", home);
+        }
+    }
 }
