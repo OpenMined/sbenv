@@ -17,7 +17,10 @@ struct SyftBoxConfig {
     data_dir: String,
     email: String,
     server_url: String,
-    client_url: String,
+    #[serde(default)]
+    client_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
 }
@@ -148,7 +151,8 @@ fn init_environment(email: Option<String>, server_url: String) -> Result<()> {
         data_dir: current_dir.to_string_lossy().to_string(),
         email: email.clone(),
         server_url: server_url.clone(),
-        client_url: client_url.clone(),
+        client_url: Some(client_url.clone()),
+        client_token: None,
         refresh_token: None,
     };
 
@@ -183,7 +187,11 @@ fn show_info() -> Result<()> {
 
     let config = load_config(&config_path)?;
 
-    let port = config.client_url.rsplit(':').next().unwrap_or("unknown");
+    let port = config
+        .client_url
+        .as_deref()
+        .and_then(|u| u.rsplit(':').next())
+        .unwrap_or("unknown");
 
     println!("{}", "📦 SyftBox Environment Info".green().bold());
     println!();
@@ -217,7 +225,9 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!("export SYFTBOX_DATA_DIR=\"{}\"", config.data_dir);
     println!("export SYFTBOX_SERVER_URL=\"{}\"", config.server_url);
     println!("export SYFTBOX_CONFIG_PATH=\"{}\"", config_path.display());
-    println!("export SYFTBOX_CLIENT_URL=\"{}\"", config.client_url);
+    if let Some(url) = &config.client_url {
+        println!("export SYFTBOX_CLIENT_URL=\"{}\"", url);
+    }
     println!("export SYFTBOX_ENV_ACTIVE=\"1\"");
 
     // Use email as the environment name for better identification
@@ -237,7 +247,9 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!(
         "        export SYFTBOX_OLD_P9K_CONTENT=\"${{POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION}}\""
     );
-    println!("        export SYFTBOX_OLD_P9K_VISUAL=\"${{POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION}}\"");
+    println!(
+        "        export SYFTBOX_OLD_P9K_VISUAL=\"${{POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION}}\""
+    );
     println!("        # Override to show box icon and email without 'Py'");
     println!(
         "        export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION='📦 {}'",
@@ -304,7 +316,9 @@ fn deactivate_environment(quiet: bool) -> Result<()> {
     println!("        unset POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION");
     println!("    fi");
     println!("    if [ -n \"$SYFTBOX_OLD_P9K_VISUAL\" ]; then");
-    println!("        export POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION=\"$SYFTBOX_OLD_P9K_VISUAL\"");
+    println!(
+        "        export POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION=\"$SYFTBOX_OLD_P9K_VISUAL\""
+    );
     println!("        unset SYFTBOX_OLD_P9K_VISUAL");
     println!("    else");
     println!("        unset POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION");
@@ -387,10 +401,9 @@ fn activate_environment_to_file(path: &Path) -> Result<()> {
         "export SYFTBOX_CONFIG_PATH=\"{}\"\n",
         config_path.display()
     ));
-    script.push_str(&format!(
-        "export SYFTBOX_CLIENT_URL=\"{}\"\n",
-        config.client_url
-    ));
+    if let Some(url) = &config.client_url {
+        script.push_str(&format!("export SYFTBOX_CLIENT_URL=\"{}\"\n", url));
+    }
     script.push_str("export SYFTBOX_ENV_ACTIVE=\"1\"\n");
     script.push_str(&format!("export SYFTBOX_ENV_NAME=\"{}\"\n", env_name));
 
@@ -454,13 +467,25 @@ fn check_shell_functions_installed(rc_file: &Path) -> Result<bool> {
 
 fn get_shell_functions() -> String {
     let mut functions = String::new();
-    functions.push_str("\n# SyftBox environment functions\n");
-    functions.push_str("sbenv() {\n");
+    functions.push_str(
+        "
+# SyftBox environment functions
+",
+    );
+    functions.push_str(
+        "sbenv() {
+",
+    );
     functions.push_str("    case \"$1\" in\n");
-    functions.push_str("        activate)\n");
+    functions.push_str(
+        "        activate)
+",
+    );
     functions.push_str("            eval \"$(command sbenv activate --quiet)\"\n");
-    functions
-        .push_str("            # Fix Powerlevel10k prompt to show 📦 and email instead of 'Py'\n");
+    functions.push_str(
+        "            # Fix Powerlevel10k prompt to show 📦 and email instead of 'Py'
+",
+    );
     functions.push_str(
         "            if [[ -n \"$ZSH_VERSION\" ]] && [[ -n \"$SYFTBOX_EMAIL\" ]]; then\n",
     );
@@ -468,47 +493,137 @@ fn get_shell_functions() -> String {
         "                export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION=\"📦 $SYFTBOX_EMAIL\"\n",
     );
     functions.push_str(
-        "                export POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION=''\n",
+        "                export POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION=''
+",
     );
-    functions
-        .push_str("                export POWERLEVEL9K_VIRTUALENV_SHOW_PYTHON_VERSION=false\n");
-    functions.push_str("                export POWERLEVEL9K_VIRTUALENV_SHOW_WITH_PYENV=false\n");
-    functions.push_str("                # Force P10k to rebuild its prompt cache\n");
-    functions.push_str("                unset _p9k__cached_p10k_param_sig 2>/dev/null\n");
-    functions.push_str("                if typeset -f p10k >/dev/null 2>&1; then\n");
-    functions.push_str("                    p10k reload 2>/dev/null\n");
-    functions.push_str("                elif typeset -f _p9k_precmd >/dev/null 2>&1; then\n");
-    functions.push_str("                    _p9k_precmd\n");
-    functions.push_str("                fi\n");
-    functions.push_str("            fi\n");
-    functions.push_str("            ;;\n");
-    functions.push_str("        deactivate)\n");
+    functions.push_str(
+        "                export POWERLEVEL9K_VIRTUALENV_SHOW_PYTHON_VERSION=false
+",
+    );
+    functions.push_str(
+        "                export POWERLEVEL9K_VIRTUALENV_SHOW_WITH_PYENV=false
+",
+    );
+    functions.push_str(
+        "                # Force P10k to rebuild its prompt cache
+",
+    );
+    functions.push_str(
+        "                unset _p9k__cached_p10k_param_sig 2>/dev/null
+",
+    );
+    functions.push_str(
+        "                if typeset -f p10k >/dev/null 2>&1; then
+",
+    );
+    functions.push_str(
+        "                    p10k reload 2>/dev/null
+",
+    );
+    functions.push_str(
+        "                elif typeset -f _p9k_precmd >/dev/null 2>&1; then
+",
+    );
+    functions.push_str(
+        "                    _p9k_precmd
+",
+    );
+    functions.push_str(
+        "                fi
+",
+    );
+    functions.push_str(
+        "            fi
+",
+    );
+    functions.push_str(
+        "            ;;
+",
+    );
+    functions.push_str(
+        "        deactivate)
+",
+    );
     functions.push_str("            eval \"$(command sbenv deactivate --quiet)\"\n");
-    functions.push_str("            # Reset P10k virtualenv display\n");
+    functions.push_str(
+        "            # Reset P10k virtualenv display
+",
+    );
     functions.push_str("            if [[ -n \"$ZSH_VERSION\" ]]; then\n");
     functions.push_str(
-        "                export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION='${VIRTUAL_ENV:t}'\n",
+        "                export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION='${VIRTUAL_ENV:t}'
+",
     );
-    functions
-        .push_str("                export POWERLEVEL9K_VIRTUALENV_SHOW_PYTHON_VERSION=false\n");
-    functions.push_str("                unset _p9k__cached_p10k_param_sig 2>/dev/null\n");
-    functions.push_str("                if typeset -f p10k >/dev/null 2>&1; then\n");
-    functions.push_str("                    p10k reload 2>/dev/null\n");
-    functions.push_str("                elif typeset -f _p9k_precmd >/dev/null 2>&1; then\n");
-    functions.push_str("                    _p9k_precmd\n");
-    functions.push_str("                fi\n");
-    functions.push_str("            fi\n");
-    functions.push_str("            ;;\n");
-    functions.push_str("        *)\n");
+    functions.push_str(
+        "                export POWERLEVEL9K_VIRTUALENV_SHOW_PYTHON_VERSION=false
+",
+    );
+    functions.push_str(
+        "                unset _p9k__cached_p10k_param_sig 2>/dev/null
+",
+    );
+    functions.push_str(
+        "                if typeset -f p10k >/dev/null 2>&1; then
+",
+    );
+    functions.push_str(
+        "                    p10k reload 2>/dev/null
+",
+    );
+    functions.push_str(
+        "                elif typeset -f _p9k_precmd >/dev/null 2>&1; then
+",
+    );
+    functions.push_str(
+        "                    _p9k_precmd
+",
+    );
+    functions.push_str(
+        "                fi
+",
+    );
+    functions.push_str(
+        "            fi
+",
+    );
+    functions.push_str(
+        "            ;;
+",
+    );
+    functions.push_str(
+        "        *)
+",
+    );
     functions.push_str("            command sbenv \"$@\"\n");
-    functions.push_str("            ;;\n");
-    functions.push_str("    esac\n");
-    functions.push_str("}\n");
+    functions.push_str(
+        "            ;;
+",
+    );
+    functions.push_str(
+        "    esac
+",
+    );
+    functions.push_str(
+        "}
+",
+    );
     functions.push('\n');
-    functions.push_str("# SyftBox environment aliases\n");
-    functions.push_str("alias sba='sbenv activate'\n");
-    functions.push_str("alias sbd='sbenv deactivate'\n");
-    functions.push_str("alias sbi='sbenv info'\n");
+    functions.push_str(
+        "# SyftBox environment aliases
+",
+    );
+    functions.push_str(
+        "alias sba='sbenv activate'
+",
+    );
+    functions.push_str(
+        "alias sbd='sbenv deactivate'
+",
+    );
+    functions.push_str(
+        "alias sbi='sbenv info'
+",
+    );
     functions
 }
 
@@ -723,14 +838,24 @@ fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
     }
 
     // Parse HTTP address from client URL
-    let http_addr = config
-        .client_url
-        .strip_prefix("http://")
-        .unwrap_or(&config.client_url);
+    // Prepare args and optionally set http addr if client_url is present
+    let mut syftbox_args: Vec<String> = vec![
+        "-c".into(),
+        config_path.to_str().unwrap().into(),
+        "daemon".into(),
+    ];
+    if let Some(url) = &config.client_url {
+        let http_addr_owned = url.strip_prefix("http://").unwrap_or(url).to_string();
+        syftbox_args.push("--http-addr".into());
+        syftbox_args.push(http_addr_owned);
+    }
 
     println!("{}", "Starting SyftBox daemon...".green());
     println!("  Email: {}", config.email.cyan());
-    println!("  Client URL: {}", config.client_url.cyan());
+    println!(
+        "  Client URL: {}",
+        config.client_url.as_deref().unwrap_or("unknown").cyan()
+    );
     println!("  Data dir: {}", config.data_dir.cyan());
     println!("  Config: {}", config_path.display().to_string().cyan());
 
@@ -759,13 +884,7 @@ fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
 
     // Start daemon process with -c flag and environment variables
     let child = Command::new("syftbox")
-        .args([
-            "-c",
-            config_path.to_str().unwrap(),
-            "daemon",
-            "--http-addr",
-            http_addr,
-        ])
+        .args(&syftbox_args)
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
         .stdout(Stdio::from(log.try_clone()?))
@@ -801,23 +920,25 @@ fn start_daemon(force: bool, skip_login_check: bool) -> Result<()> {
         println!("  Status: {}", "sbenv status".yellow());
         println!("  Stop: {}", "sbenv stop".yellow());
 
-        // Try to check HTTP API
-        thread::sleep(Duration::from_secs(1));
-        let api_check = Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                &format!("{}/v1/status", config.client_url),
-            ])
-            .output();
+        // Try to check HTTP API (if URL is available)
+        if let Some(url) = &config.client_url {
+            thread::sleep(Duration::from_secs(1));
+            let api_check = Command::new("curl")
+                .args([
+                    "-s",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    &format!("{}/v1/status", url),
+                ])
+                .output();
 
-        if let Ok(output) = api_check {
-            let status_code = String::from_utf8_lossy(&output.stdout);
-            if status_code == "200" || status_code == "401" {
-                println!("  API: {} Responding", "✓".green());
+            if let Ok(output) = api_check {
+                let status_code = String::from_utf8_lossy(&output.stdout);
+                if status_code == "200" || status_code == "401" {
+                    println!("  API: {} Responding", "✓".green());
+                }
             }
         }
     } else {
@@ -926,30 +1047,37 @@ fn show_daemon_status() -> Result<()> {
     println!("{} SyftBox daemon running", "✓".green());
     println!("  PID: {}", pid.to_string().cyan());
     println!("  Email: {}", config.email.cyan());
-    println!("  Client URL: {}", config.client_url.cyan());
+    println!(
+        "  Client URL: {}",
+        config.client_url.as_deref().unwrap_or("unknown").cyan()
+    );
     println!("  Data dir: {}", config.data_dir.cyan());
 
     // Check API
-    let api_check = Command::new("curl")
-        .args([
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            &format!("{}/v1/status", config.client_url),
-        ])
-        .output();
+    if let Some(url) = &config.client_url {
+        let api_check = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &format!("{}/v1/status", url),
+            ])
+            .output();
 
-    if let Ok(output) = api_check {
-        let status_code = String::from_utf8_lossy(&output.stdout);
-        if status_code == "200" || status_code == "401" {
-            println!("  API: {} Responding", "✓".green());
+        if let Ok(output) = api_check {
+            let status_code = String::from_utf8_lossy(&output.stdout);
+            if status_code == "200" || status_code == "401" {
+                println!("  API: {} Responding", "✓".green());
+            } else {
+                println!("  API: {} Not responding (HTTP {})", "✗".red(), status_code);
+            }
         } else {
-            println!("  API: {} Not responding (HTTP {})", "✗".red(), status_code);
+            println!("  API: {} Cannot connect", "✗".red());
         }
     } else {
-        println!("  API: {} Cannot connect", "✗".red());
+        println!("  API: {} URL not set in config", "–".dimmed());
     }
 
     Ok(())
@@ -1025,10 +1153,14 @@ fn restore_config_after_login(config_path: &Path, original_config: &SyftBoxConfi
             "server_url".to_string(),
             serde_json::Value::String(original_config.server_url.clone()),
         );
-        obj.insert(
-            "client_url".to_string(),
-            serde_json::Value::String(original_config.client_url.clone()),
-        );
+        if let Some(url) = &original_config.client_url {
+            obj.insert(
+                "client_url".to_string(),
+                serde_json::Value::String(url.clone()),
+            );
+        } else {
+            obj.remove("client_url");
+        }
         // Keep the refresh_token from login
     }
 
