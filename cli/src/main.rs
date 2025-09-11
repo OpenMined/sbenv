@@ -24,6 +24,8 @@ struct SyftBoxConfig {
     client_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
+    #[serde(default)]
+    dev_mode: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +39,10 @@ struct EnvInfo {
     email: String,
     port: u16,
     name: String,
+    #[serde(default)]
+    server_url: String,
+    #[serde(default)]
+    dev_mode: bool,
 }
 
 #[derive(Parser)]
@@ -54,9 +60,21 @@ enum Commands {
         /// Email address for the datasite
         #[arg(short, long)]
         email: Option<String>,
+        /// SyftBox server URL (overrides default)
+        #[arg(short, long)]
+        server_url: Option<String>,
+        /// Enable development mode defaults
+        #[arg(long, default_value_t = false)]
+        dev: bool,
+    },
+    /// Update current environment settings (server URL, dev mode)
+    Update {
         /// SyftBox server URL
-        #[arg(short, long, default_value = "https://syftbox.net")]
-        server_url: String,
+        #[arg(long)]
+        server_url: Option<String>,
+        /// Toggle development mode on/off
+        #[arg(long)]
+        dev: Option<bool>,
     },
     /// Display information about the current environment
     Info,
@@ -186,6 +204,8 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         email: config.email.clone(),
         port,
         name: name.clone(),
+        server_url: config.server_url.clone(),
+        dev_mode: config.dev_mode,
     };
 
     registry.environments.insert(name, env_info);
@@ -226,7 +246,7 @@ fn load_config(config_path: &Path) -> Result<SyftBoxConfig> {
     Ok(config)
 }
 
-fn init_environment(email: Option<String>, server_url: String) -> Result<()> {
+fn init_environment(email: Option<String>, server_url: Option<String>, dev: bool) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let syftbox_dir = current_dir.join(".syftbox");
 
@@ -249,14 +269,25 @@ fn init_environment(email: Option<String>, server_url: String) -> Result<()> {
 
     let port = find_available_port().context("Failed to find available port")?;
     let client_url = format!("http://127.0.0.1:{}", port);
+    let resolved_server_url = match server_url {
+        Some(url) => url,
+        None => {
+            if dev {
+                "http://localhost:8080".to_string()
+            } else {
+                "https://syftbox.net".to_string()
+            }
+        }
+    };
 
     let config = SyftBoxConfig {
         data_dir: current_dir.to_string_lossy().to_string(),
         email: email.clone(),
-        server_url: server_url.clone(),
+        server_url: resolved_server_url.clone(),
         client_url: Some(client_url.clone()),
         client_token: None,
         refresh_token: None,
+        dev_mode: dev,
     };
 
     fs::create_dir_all(&syftbox_dir).context("Failed to create .syftbox directory")?;
@@ -271,7 +302,7 @@ fn init_environment(email: Option<String>, server_url: String) -> Result<()> {
     println!("{}", "✅ SyftBox environment initialized!".green().bold());
     println!();
     println!("📧 Email: {}", email.cyan());
-    println!("🌐 Server: {}", server_url.cyan());
+    println!("🌐 Server: {}", resolved_server_url.cyan());
     println!("📁 Data dir: {}", current_dir.display().to_string().cyan());
     println!("🔌 Client port: {}", port.to_string().cyan());
     println!();
@@ -859,6 +890,12 @@ fn check_login_status(config_path: &Path) -> Result<bool> {
 }
 
 fn prompt_and_login(config_path: &Path) -> Result<()> {
+    // If this environment is in dev mode, do not attempt login
+    if load_config(config_path)?.dev_mode {
+        println!("{}", "Dev mode environment: skipping login.".yellow());
+        return Ok(());
+    }
+
     println!("{}", "You are not logged in to SyftBox.".yellow());
 
     let confirm = if atty::is(atty::Stream::Stdin) {
@@ -888,10 +925,20 @@ fn prompt_and_login(config_path: &Path) -> Result<()> {
     let original_config = load_config(config_path)?;
 
     println!("Logging in to SyftBox...");
-    let status = Command::new("syftbox")
+    let mut cmd = Command::new("syftbox");
+    let status = cmd
         .args(["-c", config_path.to_str().unwrap(), "login"])
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
+        // Enable auth bypass only in dev mode
+        .envs(
+            if load_config(config_path)?.dev_mode {
+                Some(("SYFTBOX_AUTH_ENABLED", "0"))
+            } else {
+                None::<(&str, &str)>
+            }
+            .into_iter(),
+        )
         .status()?;
 
     if !status.success() {
@@ -939,22 +986,51 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
         }
     }
 
-    // Check if logged in (unless skipped)
+    // Check if logged in (unless skipped or dev mode)
     // Only prompt if there's definitely no token
-    if !skip_login_check && !check_login_status(&config_path)? {
+    let effective_skip_login = skip_login_check || config.dev_mode;
+    if !effective_skip_login && !check_login_status(&config_path)? {
         prompt_and_login(&config_path)?;
         // Reload config after login
         config = load_config(&config_path)?;
     }
 
-    // Prepare args and optionally set http addr if client_url is present
+    // Prepare args and optionally set http addr if client_url is present (or derivable)
     let mut syftbox_args: Vec<String> = vec!["-c".into(), config_path.to_str().unwrap().into()];
     if daemon {
         syftbox_args.push("daemon".into());
     }
     if daemon {
-        if let Some(url) = &config.client_url {
-            let http_addr_owned = url.strip_prefix("http://").unwrap_or(url).to_string();
+        // Prefer config client_url, otherwise try derive from registry port
+        let derived_url = if let Some(url) = &config.client_url {
+            Some(url.clone())
+        } else {
+            // derive http://127.0.0.1:<port> from registry if available
+            let registry = load_registry().unwrap_or(EnvRegistry {
+                environments: HashMap::new(),
+            });
+            let env_dir = config_path
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let port = registry
+                .environments
+                .values()
+                .find(|info| info.path == env_dir)
+                .map(|info| info.port)
+                .unwrap_or(0);
+            if port > 0 {
+                Some(format!("http://127.0.0.1:{}", port))
+            } else {
+                None
+            }
+        };
+
+        if let Some(url) = derived_url {
+            let http_addr_owned = url.strip_prefix("http://").unwrap_or(&url).to_string();
             syftbox_args.push("--http-addr".into());
             syftbox_args.push(http_addr_owned);
         }
@@ -966,12 +1042,38 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
         println!("{}", "Starting SyftBox (background)...".green());
     }
     println!("  Email: {}", config.email.cyan());
-    println!(
-        "  Client URL: {}",
-        config.client_url.as_deref().unwrap_or("unknown").cyan()
-    );
+    // Determine client URL for display
+    let client_url_display = if let Some(url) = &config.client_url {
+        url.clone()
+    } else {
+        let registry = load_registry().unwrap_or(EnvRegistry {
+            environments: HashMap::new(),
+        });
+        let env_dir = config_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let port = registry
+            .environments
+            .values()
+            .find(|info| info.path == env_dir)
+            .map(|info| info.port)
+            .unwrap_or(0);
+        if port > 0 {
+            format!("http://127.0.0.1:{}", port)
+        } else {
+            "unknown".to_string()
+        }
+    };
+    println!("  Client URL: {}", client_url_display.cyan());
     println!("  Data dir: {}", config.data_dir.cyan());
     println!("  Config: {}", config_path.display().to_string().cyan());
+    if config.dev_mode {
+        println!("  Mode  : {}", "dev".cyan());
+    }
 
     // Create log file (both modes use the same log so 'sbenv logs' works)
     let log = fs::File::create(&log_file)?;
@@ -997,11 +1099,21 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
     }
 
     // Background execution using nohup for both modes; write output to log file
-    let child = Command::new("nohup")
+    let mut nohup = Command::new("nohup");
+    let child = nohup
         .arg("syftbox")
         .args(&syftbox_args)
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
+        // Enable auth bypass only in dev mode
+        .envs(
+            if config.dev_mode {
+                Some(("SYFTBOX_AUTH_ENABLED", "0"))
+            } else {
+                None::<(&str, &str)>
+            }
+            .into_iter(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -1167,14 +1279,42 @@ fn show_daemon_status() -> Result<()> {
     println!("{} SyftBox daemon running", "✓".green());
     println!("  PID: {}", pid.to_string().cyan());
     println!("  Email: {}", config.email.cyan());
-    println!(
-        "  Client URL: {}",
-        config.client_url.as_deref().unwrap_or("unknown").cyan()
-    );
+    // Determine client URL for display (prefer config, fallback to registry)
+    let client_url_display = if let Some(url) = &config.client_url {
+        url.clone()
+    } else {
+        let registry = load_registry().unwrap_or(EnvRegistry {
+            environments: HashMap::new(),
+        });
+        let env_dir = config_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let port = registry
+            .environments
+            .values()
+            .find(|info| info.path == env_dir)
+            .map(|info| info.port)
+            .unwrap_or(0);
+        if port > 0 {
+            format!("http://127.0.0.1:{}", port)
+        } else {
+            "unknown".to_string()
+        }
+    };
+    println!("  Client URL: {}", client_url_display.cyan());
     println!("  Data dir: {}", config.data_dir.cyan());
 
     // Check API
-    if let Some(url) = &config.client_url {
+    if let Some(url) = config
+        .client_url
+        .as_ref()
+        .or(Some(&client_url_display))
+        .filter(|u| *u != "unknown")
+    {
         let api_check = Command::new("curl")
             .args([
                 "-s",
@@ -1281,6 +1421,11 @@ fn restore_config_after_login(config_path: &Path, original_config: &SyftBoxConfi
         } else {
             obj.remove("client_url");
         }
+        // Preserve dev_mode flag
+        obj.insert(
+            "dev_mode".to_string(),
+            serde_json::Value::Bool(original_config.dev_mode),
+        );
         // Keep the refresh_token from login
     }
 
@@ -1299,16 +1444,31 @@ fn login_to_syftbox() -> Result<()> {
 
     let original_config = load_config(&config_path)?;
 
+    if original_config.dev_mode {
+        println!("{}", "Dev mode environment: skipping login.".yellow());
+        return Ok(());
+    }
+
     println!("{}", "Logging in to SyftBox...".green());
     println!("  Email: {}", original_config.email.cyan());
     println!("  Server: {}", original_config.server_url.cyan());
     println!("  Config: {}", config_path.display().to_string().cyan());
     println!();
 
-    let status = Command::new("syftbox")
+    let mut cmd = Command::new("syftbox");
+    let status = cmd
         .args(["-c", config_path.to_str().unwrap(), "login"])
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
+        // Enable auth bypass only in dev mode
+        .envs(
+            if original_config.dev_mode {
+                Some(("SYFTBOX_AUTH_ENABLED", "0"))
+            } else {
+                None::<(&str, &str)>
+            }
+            .into_iter(),
+        )
         .status()
         .context("Failed to run syftbox login. Is 'syftbox' installed?")?;
 
@@ -1347,10 +1507,64 @@ fn list_environments() -> Result<()> {
         let status = if exists { "✅".green() } else { "❌".red() };
 
         println!("  {} {} ({})", status, name.cyan(), info.email);
-        println!("     Path: {}", info.path);
-        println!("     Port: {}", info.port);
+        println!("     Path : {}", info.path);
+        println!("     Port : {}", info.port);
+        if !info.server_url.is_empty() {
+            println!("     Server: {}", info.server_url);
+        }
+        println!(
+            "     Dev  : {}",
+            if info.dev_mode { "true" } else { "false" }
+        );
         println!();
     }
+
+    Ok(())
+}
+
+fn update_environment(server_url: Option<String>, dev: Option<bool>) -> Result<()> {
+    let current_dir = env::current_dir().context("Failed to get current directory")?;
+    let config_path = find_syftbox_config(&current_dir).ok_or_else(|| {
+        anyhow::anyhow!("No SyftBox environment found in current directory or parents")
+    })?;
+
+    let mut config = load_config(&config_path)?;
+
+    let mut changed = false;
+    if let Some(url) = server_url {
+        if config.server_url != url {
+            config.server_url = url;
+            changed = true;
+        }
+    }
+    if let Some(dev_mode) = dev {
+        if config.dev_mode != dev_mode {
+            config.dev_mode = dev_mode;
+            changed = true;
+        }
+    }
+
+    if !changed {
+        println!("No changes specified. Use --server_url or --dev true/false.");
+        return Ok(());
+    }
+
+    // Save updated config
+    let config_json =
+        serde_json::to_string_pretty(&config).context("Failed to serialize config")?;
+    fs::write(&config_path, config_json).context("Failed to write config file")?;
+
+    // Update environment registry (path is env dir of config)
+    let env_dir = config_path.parent().unwrap().parent().unwrap();
+    register_environment(env_dir, &config)?;
+
+    println!("{}", "✅ Environment updated".green().bold());
+    println!("  Email : {}", config.email.cyan());
+    println!("  Server: {}", config.server_url.cyan());
+    println!(
+        "  Dev   : {}",
+        if config.dev_mode { "true" } else { "false" }
+    );
 
     Ok(())
 }
@@ -1359,8 +1573,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Init { email, server_url }) => {
-            init_environment(email.clone(), server_url.clone())?;
+        Some(Commands::Init {
+            email,
+            server_url,
+            dev,
+        }) => {
+            init_environment(email.clone(), server_url.clone(), *dev)?;
         }
         Some(Commands::Info) => {
             show_info()?;
@@ -1377,6 +1595,9 @@ fn main() -> Result<()> {
         }
         Some(Commands::Remove { path }) => {
             remove_environment(path.clone())?;
+        }
+        Some(Commands::Update { server_url, dev }) => {
+            update_environment(server_url.clone(), *dev)?;
         }
         Some(Commands::InstallShell { manual }) => {
             if *manual {
@@ -1503,6 +1724,8 @@ mod tests {
                 email: format!("test{}@example.com", i),
                 port: 7940 + i as u16,
                 name: format!("test{}", i),
+                server_url: "https://test.server".to_string(),
+                dev_mode: false,
             };
             registry.environments.insert(format!("test{}", i), env_info);
         }
@@ -1539,6 +1762,7 @@ mod tests {
             client_url: Some("http://127.0.0.1:7950".to_string()),
             client_token: None,
             refresh_token: None,
+            dev_mode: false,
         };
 
         // Register environment
@@ -1598,6 +1822,8 @@ mod tests {
                 email: "test1@example.com".to_string(),
                 port: 7940,
                 name: "env1".to_string(),
+                server_url: "https://test.server".to_string(),
+                dev_mode: false,
             },
         );
         registry.environments.insert(
@@ -1607,6 +1833,8 @@ mod tests {
                 email: "test2@example.com".to_string(),
                 port: 7945,
                 name: "env2".to_string(),
+                server_url: "https://test.server".to_string(),
+                dev_mode: false,
             },
         );
 
@@ -1632,6 +1860,7 @@ mod tests {
             client_url: Some("http://127.0.0.1:7950".to_string()),
             client_token: None,
             refresh_token: None,
+            dev_mode: false,
         };
 
         let port = config
@@ -1653,6 +1882,7 @@ mod tests {
             client_url: Some("http://localhost:8080".to_string()),
             client_token: None,
             refresh_token: None,
+            dev_mode: false,
         };
 
         let port = config
@@ -1683,6 +1913,8 @@ mod tests {
                 email: "persist@example.com".to_string(),
                 port: 7960,
                 name: "persistent_env".to_string(),
+                server_url: "https://test.server".to_string(),
+                dev_mode: false,
             },
         );
         save_registry(&registry).unwrap();
