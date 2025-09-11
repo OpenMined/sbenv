@@ -190,10 +190,8 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!("export SYFTBOX_CLIENT_URL=\"{}\"", config.client_url);
     println!("export SYFTBOX_ENV_ACTIVE=\"1\"");
 
-    let env_name = Path::new(&config.data_dir)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("sbenv");
+    // Use email as the environment name for better identification
+    let env_name = config.email.clone();
 
     println!("export SYFTBOX_ENV_NAME=\"{}\"", env_name);
 
@@ -210,8 +208,8 @@ fn activate_environment(quiet: bool) -> Result<()> {
         "        export SYFTBOX_OLD_P9K_CONTENT=\"${{POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION}}\""
     );
     println!("        export SYFTBOX_OLD_P9K_VISUAL=\"${{POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION}}\"");
-    println!("        # Override to show box icon and env name without 'Py'");
-    println!("        export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION='📦 ${{VIRTUAL_ENV:t}}'");
+    println!("        # Override to show box icon and email without 'Py'");
+    println!("        export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION='📦 {}'", config.email);
     println!("        export POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION=''");
     println!("        export POWERLEVEL9K_VIRTUALENV_SHOW_PYTHON_VERSION=false");
     println!("        export POWERLEVEL9K_VIRTUALENV_SHOW_WITH_PYENV=false");
@@ -227,7 +225,7 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!("    export PS1=\"📦 ($SYFTBOX_ENV_NAME) $PS1\"");
     println!("fi");
 
-    println!("echo \"SyftBox environment activated: $SYFTBOX_ENV_NAME\" >&2");
+    println!("echo \"SyftBox environment activated: {}\" >&2", config.email);
 
     // Force Powerlevel10k to refresh if it's running
     println!("if typeset -f _p9k_precmd >/dev/null 2>&1; then");
@@ -501,9 +499,34 @@ fn get_shell_functions() -> String {
     functions.push_str("    case \"$1\" in\n");
     functions.push_str("        activate)\n");
     functions.push_str("            eval \"$(command sbenv activate --quiet)\"\n");
+    functions.push_str("            # Fix Powerlevel10k prompt to show 📦 and email instead of 'Py'\n");
+    functions.push_str("            if [[ -n \"$ZSH_VERSION\" ]] && [[ -n \"$SYFTBOX_EMAIL\" ]]; then\n");
+    functions.push_str("                export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION=\"📦 $SYFTBOX_EMAIL\"\n");
+    functions.push_str("                export POWERLEVEL9K_VIRTUALENV_VISUAL_IDENTIFIER_EXPANSION=''\n");
+    functions.push_str("                export POWERLEVEL9K_VIRTUALENV_SHOW_PYTHON_VERSION=false\n");
+    functions.push_str("                export POWERLEVEL9K_VIRTUALENV_SHOW_WITH_PYENV=false\n");
+    functions.push_str("                # Force P10k to rebuild its prompt cache\n");
+    functions.push_str("                unset _p9k__cached_p10k_param_sig 2>/dev/null\n");
+    functions.push_str("                if typeset -f p10k >/dev/null 2>&1; then\n");
+    functions.push_str("                    p10k reload 2>/dev/null\n");
+    functions.push_str("                elif typeset -f _p9k_precmd >/dev/null 2>&1; then\n");
+    functions.push_str("                    _p9k_precmd\n");
+    functions.push_str("                fi\n");
+    functions.push_str("            fi\n");
     functions.push_str("            ;;\n");
     functions.push_str("        deactivate)\n");
     functions.push_str("            eval \"$(command sbenv deactivate --quiet)\"\n");
+    functions.push_str("            # Reset P10k virtualenv display\n");
+    functions.push_str("            if [[ -n \"$ZSH_VERSION\" ]]; then\n");
+    functions.push_str("                export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION='${VIRTUAL_ENV:t}'\n");
+    functions.push_str("                export POWERLEVEL9K_VIRTUALENV_SHOW_PYTHON_VERSION=false\n");
+    functions.push_str("                unset _p9k__cached_p10k_param_sig 2>/dev/null\n");
+    functions.push_str("                if typeset -f p10k >/dev/null 2>&1; then\n");
+    functions.push_str("                    p10k reload 2>/dev/null\n");
+    functions.push_str("                elif typeset -f _p9k_precmd >/dev/null 2>&1; then\n");
+    functions.push_str("                    _p9k_precmd\n");
+    functions.push_str("                fi\n");
+    functions.push_str("            fi\n");
     functions.push_str("            ;;\n");
     functions.push_str("        *)\n");
     functions.push_str("            command sbenv \"$@\"\n");
