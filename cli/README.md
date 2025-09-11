@@ -45,10 +45,25 @@ This will detect your shell (bash/zsh) and add the necessary functions to your s
 ### 2. Create an Environment
 
 ```bash
-sbenv init myproject
+sbenv init
 ```
 
 This creates a new SyftBox environment in the current directory.
+
+#### Dev mode
+Dev mode sets SYFTBOX_AUTH_ENABLED=0 and defaults to localhost:8080.
+You can override that with the --server_url param.
+
+```bash
+sbenv init --dev                 # defaults server_url to http://localhost:8080
+sbenv init --dev --server_url https://dev.syftbox.net
+sbenv init --server_url https://custom.server
+```
+
+Notes:
+- With `--dev`, default `server_url` is `http://localhost:8080` (overridable).
+- Without `--dev`, default `server_url` is `https://syftbox.net`.
+- In dev mode, `sbenv start` and `sbenv login` run syftbox with `SYFTBOX_AUTH_ENABLED=0`.
 
 ### 3. Activate an Environment
 
