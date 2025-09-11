@@ -58,8 +58,6 @@ enum Commands {
         #[arg(short, long)]
         quiet: bool,
     },
-    /// List all SyftBox environments
-    List,
     /// Remove a SyftBox environment
     Remove {
         /// Path to the environment to remove (defaults to current directory)
@@ -327,82 +325,6 @@ fn deactivate_environment(quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn list_environments() -> Result<()> {
-    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
-    let mut environments = Vec::new();
-
-    fn find_environments(dir: &Path, environments: &mut Vec<PathBuf>, depth: usize) {
-        if depth > 5 {
-            return;
-        }
-
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let config_path = path.join(".syftbox").join("config.json");
-                    if config_path.exists() {
-                        environments.push(path.clone());
-                    }
-                    if path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| !n.starts_with('.'))
-                        .unwrap_or(false)
-                    {
-                        find_environments(&path, environments, depth + 1);
-                    }
-                }
-            }
-        }
-    }
-
-    println!("{}", "🔍 Searching for SyftBox environments...".yellow());
-    find_environments(&home_dir, &mut environments, 0);
-
-    if let Ok(current_dir) = env::current_dir() {
-        if !current_dir.starts_with(&home_dir) {
-            find_environments(&current_dir, &mut environments, 0);
-        }
-    }
-
-    if environments.is_empty() {
-        println!("{}", "No SyftBox environments found".red());
-    } else {
-        println!(
-            "{}",
-            format!("Found {} environment(s):", environments.len())
-                .green()
-                .bold()
-        );
-        println!();
-
-        for env_path in environments {
-            let config_path = env_path.join(".syftbox").join("config.json");
-            match load_config(&config_path) {
-                Ok(config) => {
-                    println!("📦 {}", env_path.display().to_string().cyan());
-                    println!("   Email: {}", config.email);
-                    println!("   Server: {}", config.server_url);
-                    let port = config.client_url.rsplit(':').next().unwrap_or("unknown");
-                    println!("   Port: {}", port);
-                    println!();
-                }
-                Err(_) => {
-                    println!(
-                        "📦 {} {}",
-                        env_path.display().to_string().cyan(),
-                        "(invalid config)".red()
-                    );
-                    println!();
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn remove_environment(path: Option<PathBuf>) -> Result<()> {
     let target_path = path.unwrap_or_else(|| env::current_dir().unwrap());
     let syftbox_dir = target_path.join(".syftbox");
@@ -587,7 +509,6 @@ fn get_shell_functions() -> String {
     functions.push_str("alias sba='sbenv activate'\n");
     functions.push_str("alias sbd='sbenv deactivate'\n");
     functions.push_str("alias sbi='sbenv info'\n");
-    functions.push_str("alias sbl='sbenv list'\n");
     functions
 }
 
@@ -699,7 +620,6 @@ fn install_shell_functions() -> Result<()> {
     println!("  {} - Activate (shortcut)", "sba".cyan());
     println!("  {} - Deactivate (shortcut)", "sbd".cyan());
     println!("  {} - Show info (shortcut)", "sbi".cyan());
-    println!("  {} - List environments (shortcut)", "sbl".cyan());
 
     Ok(())
 }
@@ -1177,9 +1097,6 @@ fn main() -> Result<()> {
         Some(Commands::Deactivate { quiet }) => {
             deactivate_environment(*quiet)?;
         }
-        Some(Commands::List) => {
-            list_environments()?;
-        }
         Some(Commands::Remove { path }) => {
             remove_environment(path.clone())?;
         }
@@ -1235,7 +1152,6 @@ fn main() -> Result<()> {
                 );
                 println!("  {} - Activate environment", "sbenv activate".yellow());
                 println!("  {} - Deactivate environment", "sbenv deactivate".yellow());
-                println!("  {} - List all environments", "sbenv list".yellow());
                 println!("  {} - Remove an environment", "sbenv remove".yellow());
                 println!(
                     "  {} - Install shell functions for easier use",
