@@ -327,7 +327,7 @@ fn show_info() -> Result<()> {
     let env_dir = config_path.parent().unwrap().parent().unwrap();
     let _ = register_environment(env_dir, &config);
 
-    let port = config
+    let _port = config
         .client_url
         .as_deref()
         .and_then(|u| u.rsplit(':').next())
@@ -335,14 +335,82 @@ fn show_info() -> Result<()> {
 
     println!("{}", "📦 SyftBox Environment Info".green().bold());
     println!();
+    println!("{}", "── Local Environment ──".dimmed());
     println!("📧 Email: {}", config.email.cyan());
     println!("🌐 Server URL: {}", config.server_url.cyan());
     println!("📁 Data dir: {}", config.data_dir.cyan());
-    println!("🔌 Client port: {}", port.cyan());
+    println!(
+        "🔌 Client URL: {}",
+        config.client_url.as_deref().unwrap_or("not set").cyan()
+    );
+    println!(
+        "⚙️  Dev mode: {}",
+        if config.dev_mode {
+            "enabled".green()
+        } else {
+            "disabled".dimmed()
+        }
+    );
     println!(
         "📄 Config path: {}",
         config_path.display().to_string().cyan()
     );
+
+    // Show raw config.json content
+    println!();
+    println!("{}", "── Config File Content ──".dimmed());
+    if let Ok(config_content) = fs::read_to_string(&config_path) {
+        // Parse and pretty print the JSON
+        if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&config_content) {
+            if let Ok(pretty_json) = serde_json::to_string_pretty(&json_value) {
+                for line in pretty_json.lines() {
+                    println!("  {}", line.dimmed());
+                }
+            }
+        }
+    }
+
+    // Show global sbenv registry info
+    println!();
+    println!("{}", "── Global sbenv Registry ──".dimmed());
+    let registry = load_registry().unwrap_or(EnvRegistry {
+        environments: HashMap::new(),
+    });
+
+    let env_dir_str = env_dir.to_string_lossy().to_string();
+    let env_name = env_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    if let Some(env_info) = registry.environments.get(env_name) {
+        println!("📝 Registered as: {}", env_name.cyan());
+        println!("🏠 Location: {}", env_info.path.cyan());
+        println!("🔗 Server: {}", env_info.server_url.cyan());
+        println!("🔌 Port: {}", env_info.port.to_string().cyan());
+        println!(
+            "⚙️  Dev mode: {}",
+            if env_info.dev_mode {
+                "enabled".green()
+            } else {
+                "disabled".dimmed()
+            }
+        );
+    } else {
+        println!("⚠️  Not registered in global sbenv");
+        println!("   Run {} to register", "sbenv init".yellow());
+    }
+
+    // Show all registered environments
+    if registry.environments.len() > 1 {
+        println!();
+        println!("{}", "── Other Environments ──".dimmed());
+        for (name, info) in registry.environments.iter() {
+            if info.path != env_dir_str {
+                println!("  • {} ({})", name.cyan(), info.path.dimmed());
+            }
+        }
+    }
 
     Ok(())
 }
@@ -952,10 +1020,55 @@ fn prompt_and_login(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_orphaned_processes(config_path: &Path) -> Result<()> {
+    // Check for any syftbox processes using this config file
+    let config_path_str = config_path.to_str().unwrap();
+
+    // Use pgrep to find syftbox processes
+    let output = Command::new("pgrep").args(["-fl", "syftbox"]).output();
+
+    if let Ok(output) = output {
+        let processes = String::from_utf8_lossy(&output.stdout);
+        for line in processes.lines() {
+            // Check if this process is using our config file
+            if line.contains(config_path_str) {
+                // Extract PID from the line (first field)
+                if let Some(pid_str) = line.split_whitespace().next() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        println!(
+                            "Found orphaned syftbox process (PID: {}) for this environment",
+                            pid
+                        );
+                        println!("Killing orphaned process...");
+
+                        // Try graceful kill first
+                        Command::new("kill").arg(pid.to_string()).output()?;
+                        thread::sleep(Duration::from_secs(2));
+
+                        // Check if still running and force kill if needed
+                        let check = Command::new("ps").args(["-p", &pid.to_string()]).output()?;
+                        if check.status.success() {
+                            println!("Force killing stubborn process...");
+                            Command::new("kill")
+                                .args(["-9", &pid.to_string()])
+                                .output()?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let config_path = find_syftbox_config(&current_dir)
         .ok_or_else(|| anyhow::anyhow!("No SyftBox environment found. Run 'sbenv init' first."))?;
+
+    // Clean up any orphaned processes for this environment
+    cleanup_orphaned_processes(&config_path)?;
 
     let mut config = load_config(&config_path)?;
     // Always use the environment directory for PID and logs, not config.data_dir
@@ -1088,11 +1201,14 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
         .unwrap()
         .join(".syftbox")
         .join("config.json.sbenv_backup");
+    let local_config_backup = config_path.with_extension("json.sbenv_local_backup");
     let mut restored_home_config = false;
 
     if home_config.exists() && home_config != config_path {
         println!("  Temporarily moving global config aside...");
         fs::rename(&home_config, &home_config_backup)?;
+        // Backup our local config before copying it to global location
+        fs::copy(&config_path, &local_config_backup)?;
         // Copy our config to the global location
         fs::copy(&config_path, &home_config)?;
         restored_home_config = true;
@@ -1135,6 +1251,11 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
         thread::sleep(Duration::from_millis(500)); // Give daemon time to read config
         fs::remove_file(&home_config).ok();
         fs::rename(&home_config_backup, &home_config)?;
+        // Restore our local config from backup to preserve dev_mode and other fields
+        if local_config_backup.exists() {
+            fs::copy(&local_config_backup, &config_path)?;
+            fs::remove_file(&local_config_backup)?;
+        }
         println!("  Restored global config");
     }
 
@@ -1193,8 +1314,11 @@ fn stop_daemon() -> Result<()> {
     let env_dir = config_path.parent().unwrap().parent().unwrap();
     let pid_file = env_dir.join(".syftbox").join("syftbox.pid");
 
+    // First, check for and clean up any orphaned processes for this environment
+    cleanup_orphaned_processes(&config_path)?;
+
     if !pid_file.exists() {
-        println!("{}", "No daemon is running".yellow());
+        println!("{}", "No daemon PID file found".yellow());
         return Ok(());
     }
 
