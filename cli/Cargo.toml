@@ -29,8 +29,9 @@ dialoguer = "0.11"
 atty = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 self_update = { version = "0.40", features = ["archive-tar", "compression-flate2"] }
-reqwest = { version = "0.11", features = ["json"] }
-openssl = { version = "0.10", features = ["vendored"] }
+# Use rustls to avoid OpenSSL build issues across platforms
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# removed explicit openssl dependency to avoid vendored OpenSSL build
 tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "macros"] }
 semver = "1.0"
 
