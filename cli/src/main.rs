@@ -68,8 +68,8 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         dev: bool,
     },
-    /// Update current environment settings (server URL, dev mode)
-    Update {
+    /// Edit current environment settings (server URL, dev mode)
+    Edit {
         /// SyftBox server URL
         #[arg(long)]
         server_url: Option<String>,
@@ -137,7 +137,7 @@ enum Commands {
     /// List all SyftBox environments
     List,
     /// Update sbenv to the latest version
-    SelfUpdate {
+    Update {
         /// Force update without confirmation
         #[arg(short, long)]
         force: bool,
@@ -1943,7 +1943,7 @@ fn main() -> Result<()> {
         Some(Commands::Remove { path }) => {
             remove_environment(path.clone())?;
         }
-        Some(Commands::Update { server_url, dev }) => {
+        Some(Commands::Edit { server_url, dev }) => {
             update_environment(server_url.clone(), *dev)?;
         }
         Some(Commands::InstallShell { manual }) => {
@@ -1985,7 +1985,7 @@ fn main() -> Result<()> {
         Some(Commands::List) => {
             list_environments()?;
         }
-        Some(Commands::SelfUpdate { force }) => {
+        Some(Commands::Update { force }) => {
             self_update_sbenv(*force)?;
         }
         None => {
