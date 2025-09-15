@@ -35,8 +35,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # removed explicit openssl dependency to avoid vendored OpenSSL build
 tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "macros"] }
 semver = "1.0"
-# Ensure any transitive openssl-sys uses vendored OpenSSL (fixes musl builds)
-openssl-sys = { version = "0.9", features = ["vendored"], optional = false }
 
 [dev-dependencies]
 tempfile = "3.8"
