@@ -480,9 +480,16 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!("        export PS1=\"📦 ($SYFTBOX_ENV_NAME) $PS1\"");
     println!("    fi");
     println!("else");
-    println!("    # Bash");
-    println!("    export SYFTBOX_OLD_PS1=\"$PS1\"");
-    println!("    export PS1=\"📦 ($SYFTBOX_ENV_NAME) $PS1\"");
+    println!("    # Bash - detect if using PROMPT_COMMAND (modern prompt frameworks)");
+    println!("    if [ -n \"$PROMPT_COMMAND\" ]; then");
+    println!("        # Using a prompt framework like Starship, Oh My Bash, etc.");
+    println!("        export SYFTBOX_OLD_PROMPT_COMMAND=\"$PROMPT_COMMAND\"");
+    println!("        export PROMPT_COMMAND='echo -ne \"\\033[0m📦 (${{SYFTBOX_ENV_NAME}}) \"; '\"$PROMPT_COMMAND\"");
+    println!("    else");
+    println!("        # Traditional bash prompt");
+    println!("        export SYFTBOX_OLD_PS1=\"$PS1\"");
+    println!("        export PS1=\"\\[\\033[0m\\]📦 (${{SYFTBOX_ENV_NAME}}) ${{PS1}}\"");
+    println!("    fi");
     println!("fi");
 
     println!(
@@ -542,8 +549,12 @@ fn deactivate_environment(quiet: bool) -> Result<()> {
     println!("    unset POWERLEVEL9K_VIRTUALENV_SHOW_WITH_PYENV");
     println!("fi");
 
-    // Restore PS1 for non-Powerlevel10k shells
-    println!("if [ -n \"$SYFTBOX_OLD_PS1\" ]; then");
+    // Restore PS1 or PROMPT_COMMAND for non-Powerlevel10k shells
+    println!("# Restore bash prompt");
+    println!("if [ -n \"$SYFTBOX_OLD_PROMPT_COMMAND\" ]; then");
+    println!("    export PROMPT_COMMAND=\"$SYFTBOX_OLD_PROMPT_COMMAND\"");
+    println!("    unset SYFTBOX_OLD_PROMPT_COMMAND");
+    println!("elif [ -n \"$SYFTBOX_OLD_PS1\" ]; then");
     println!("    export PS1=\"$SYFTBOX_OLD_PS1\"");
     println!("    unset SYFTBOX_OLD_PS1");
     println!("fi");
@@ -702,9 +713,8 @@ fn get_shell_functions() -> String {
         "            # Fix Powerlevel10k prompt to show 📦 and email instead of 'Py'
 ",
     );
-    functions.push_str(
-        "            if [[ -n \"$ZSH_VERSION\" ]] && [[ -n \"$SYFTBOX_EMAIL\" ]]; then\n",
-    );
+    functions
+        .push_str("            if [ -n \"$ZSH_VERSION\" ] && [ -n \"$SYFTBOX_EMAIL\" ]; then\n");
     functions.push_str(
         "                export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION=\"📦 $SYFTBOX_EMAIL\"\n",
     );
@@ -765,7 +775,7 @@ fn get_shell_functions() -> String {
         "            # Reset P10k virtualenv display
 ",
     );
-    functions.push_str("            if [[ -n \"$ZSH_VERSION\" ]]; then\n");
+    functions.push_str("            if [ -n \"$ZSH_VERSION\" ]; then\n");
     functions.push_str(
         "                export POWERLEVEL9K_VIRTUALENV_CONTENT_EXPANSION='${VIRTUAL_ENV:t}'
 ",
