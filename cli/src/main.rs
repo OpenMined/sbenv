@@ -44,6 +44,22 @@ struct EnvInfo {
     server_url: String,
     #[serde(default)]
     dev_mode: bool,
+    #[serde(default)]
+    binary: Option<String>,
+    #[serde(default)]
+    binary_version: Option<String>,
+    #[serde(default)]
+    binary_hash: Option<String>,
+    #[serde(default)]
+    binary_os: Option<String>,
+    #[serde(default)]
+    binary_arch: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct GlobalConfig {
+    #[serde(default)]
+    default_binary: Option<String>, // path or version
 }
 
 #[derive(Parser)]
@@ -67,6 +83,9 @@ enum Commands {
         /// Enable development mode defaults
         #[arg(long, default_value_t = false)]
         dev: bool,
+        /// Specify syftbox binary (path) or version (e.g. 0.8.5)
+        #[arg(long)]
+        binary: Option<String>,
     },
     /// Edit current environment settings (server URL, dev mode)
     Edit {
@@ -76,6 +95,9 @@ enum Commands {
         /// Toggle development mode on/off
         #[arg(long)]
         dev: Option<bool>,
+        /// Change syftbox binary (path) or version
+        #[arg(long)]
+        binary: Option<String>,
     },
     /// Display information about the current environment
     Info,
@@ -149,6 +171,11 @@ fn get_registry_path() -> PathBuf {
     Path::new(&home).join(".sbenv").join("envs.json")
 }
 
+fn get_global_config_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".sbenv").join("config.json")
+}
+
 fn load_registry() -> Result<EnvRegistry> {
     let registry_path = get_registry_path();
     if !registry_path.exists() {
@@ -168,6 +195,27 @@ fn save_registry(registry: &EnvRegistry) -> Result<()> {
     }
     let content = serde_json::to_string_pretty(&registry)?;
     fs::write(&registry_path, content)?;
+    Ok(())
+}
+
+fn load_global_config() -> GlobalConfig {
+    let path = get_global_config_path();
+    if !path.exists() {
+        return GlobalConfig::default();
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<GlobalConfig>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_global_config(cfg: &GlobalConfig) -> Result<()> {
+    let path = get_global_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let s = serde_json::to_string_pretty(cfg)?;
+    fs::write(path, s)?;
     Ok(())
 }
 
@@ -206,6 +254,8 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(0);
 
+    // Preserve existing binary info if present
+    let existing = registry.environments.get(&name).cloned();
     let env_info = EnvInfo {
         path: path.to_string_lossy().to_string(),
         email: config.email.clone(),
@@ -213,6 +263,11 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         name: name.clone(),
         server_url: config.server_url.clone(),
         dev_mode: config.dev_mode,
+        binary: existing.as_ref().and_then(|e| e.binary.clone()),
+        binary_version: existing.as_ref().and_then(|e| e.binary_version.clone()),
+        binary_hash: existing.as_ref().and_then(|e| e.binary_hash.clone()),
+        binary_os: existing.as_ref().and_then(|e| e.binary_os.clone()),
+        binary_arch: existing.as_ref().and_then(|e| e.binary_arch.clone()),
     };
 
     registry.environments.insert(name, env_info);
@@ -231,6 +286,509 @@ fn unregister_environment(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn ensure_marker_exists(config_path: &Path, config: &SyftBoxConfig) -> Result<()> {
+    // Ensure a .sbenv marker exists in the environment root
+    let env_dir = config_path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Invalid config path layout"))?;
+    let marker = env_dir.join(".sbenv");
+    if marker.exists() {
+        return Ok(());
+    }
+
+    // Determine port: prefer config.client_url, fallback to registry by path, else 0
+    let port_from_config = config
+        .client_url
+        .as_deref()
+        .and_then(|u| u.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok());
+    let port = if let Some(p) = port_from_config {
+        p
+    } else {
+        let registry = load_registry().unwrap_or(EnvRegistry {
+            environments: HashMap::new(),
+        });
+        let env_dir_str = env_dir.to_string_lossy().to_string();
+        registry
+            .environments
+            .values()
+            .find(|info| info.path == env_dir_str)
+            .map(|info| info.port)
+            .unwrap_or(0)
+    };
+
+    let obj = serde_json::json!({
+        "email": config.email,
+        "port": port,
+        "server_url": config.server_url,
+    });
+    let content = serde_json::to_string_pretty(&obj)? + "\n";
+    fs::write(&marker, content)?;
+    Ok(())
+}
+
+fn get_binaries_dir() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".sbenv").join("binaries")
+}
+
+fn parse_syftbox_version_output(output: &str) -> Option<String> {
+    // Expected: syftbox version 0.8.5 (...)
+    let lower = output.trim();
+    let parts: Vec<&str> = lower.split_whitespace().collect();
+    let idx = parts.iter().position(|p| *p == "version")?;
+    parts.get(idx + 1).map(|s| s.to_string())
+}
+
+#[derive(Debug, Clone, Default)]
+struct SyftboxDetails {
+    version: Option<String>,
+    hash: Option<String>,
+    go_version: Option<String>,
+    os: Option<String>,
+    arch: Option<String>,
+    build_time: Option<String>,
+}
+
+fn parse_syftbox_details(output: &str) -> SyftboxDetails {
+    // syftbox version 0.8.5 (26645a3; go1.24.3; darwin/arm64; 2025-09-16T04:17:56Z)
+    let mut det = SyftboxDetails::default();
+    det.version = parse_syftbox_version_output(output);
+    if let Some(start) = output.find('(') {
+        if let Some(end) = output[start + 1..].find(')') {
+            let inner = &output[start + 1..start + 1 + end];
+            let parts: Vec<&str> = inner.split(';').map(|s| s.trim()).collect();
+            if let Some(hash) = parts.get(0) {
+                if !hash.is_empty() {
+                    det.hash = Some((*hash).to_string());
+                }
+            }
+            if let Some(go) = parts.get(1) {
+                if !go.is_empty() {
+                    det.go_version = Some((*go).to_string());
+                }
+            }
+            if let Some(target) = parts.get(2) {
+                if let Some((os, arch)) = target.split_once('/') {
+                    det.os = Some(os.to_string());
+                    det.arch = Some(arch.to_string());
+                }
+            }
+            if let Some(bt) = parts.get(3) {
+                if !bt.is_empty() {
+                    det.build_time = Some((*bt).to_string());
+                }
+            }
+        }
+    }
+    det
+}
+
+fn detect_binary_details(bin: &Path) -> SyftboxDetails {
+    let out = Command::new(bin).arg("--version").output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            return parse_syftbox_details(&s);
+        }
+    }
+    SyftboxDetails::default()
+}
+
+fn which_syftbox() -> Option<PathBuf> {
+    let out = Command::new("which").arg("syftbox").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if p.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(p))
+    }
+}
+
+fn current_os_arch() -> (String, String) {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    (os.to_string(), arch.to_string())
+}
+
+fn ensure_syftbox_version(version: &str) -> Result<PathBuf> {
+    let bin_dir = get_binaries_dir().join(version);
+    let bin_path = bin_dir.join("syftbox");
+    if bin_path.exists() {
+        return Ok(bin_path);
+    }
+
+    fs::create_dir_all(&bin_dir)?;
+    let (os, arch) = current_os_arch();
+    let base = format!(
+        "https://github.com/OpenMined/syftbox/releases/download/v{}/",
+        version
+    );
+    let candidates = vec![
+        format!("syftbox_{}_{}_{}.tar.gz", version, os, arch),
+        format!("syftbox-{}-{}-{}.tar.gz", version, os, arch),
+        format!("syftbox_{}_{}_{}.zip", version, os, arch),
+        format!("syftbox-{}-{}-{}.zip", version, os, arch),
+        format!("syftbox_{}_{}_{}", version, os, arch),
+        format!("syftbox-{}-{}-{}", version, os, arch),
+    ];
+
+    let tmp_dir = bin_dir.join("_tmp");
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir)?;
+
+    let mut last_err: Option<anyhow::Error> = None;
+
+    // Try GitHub API to find the correct asset for this OS/arch
+    if let Some((asset_url, asset_name)) = github_release_asset_for(version) {
+        let tmp_file = tmp_dir.join("download_asset");
+        let status = Command::new("curl")
+            .args(["-fL", "-o", tmp_file.to_str().unwrap(), &asset_url])
+            .status();
+        if let Ok(st) = status {
+            if st.success() {
+                if let Err(e) =
+                    install_syftbox_from_download(&tmp_file, &asset_name, &tmp_dir, &bin_path)
+                {
+                    last_err = Some(e);
+                } else {
+                    let _ = fs::remove_dir_all(&tmp_dir);
+                    return Ok(bin_path);
+                }
+            }
+        }
+    }
+    for name in candidates {
+        let url = format!("{}{}", base, name);
+        let tmp_file = tmp_dir.join("download.bin");
+        let status = Command::new("curl")
+            .args(["-fL", "-o", tmp_file.to_str().unwrap(), &url])
+            .status();
+        if let Ok(st) = status {
+            if st.success() {
+                // Try to detect archive by extension
+                let lower = name.to_lowercase();
+                if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+                    let st2 = Command::new("tar")
+                        .args([
+                            "-xzf",
+                            tmp_file.to_str().unwrap(),
+                            "-C",
+                            tmp_dir.to_str().unwrap(),
+                        ])
+                        .status();
+                    if st2.as_ref().map(|s| s.success()).unwrap_or(false) {
+                        // find a file named syftbox in tmp_dir tree
+                        if let Some(found) = find_in_dir(&tmp_dir, "syftbox") {
+                            fs::rename(&found, &bin_path)?;
+                            let _ = fs::remove_dir_all(&tmp_dir);
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let mut perm = fs::metadata(&bin_path)?.permissions();
+                                perm.set_mode(0o755);
+                                fs::set_permissions(&bin_path, perm)?;
+                            }
+                            return Ok(bin_path);
+                        }
+                    }
+                } else if lower.ends_with(".zip") {
+                    // Try unzip
+                    let st2 = Command::new("unzip")
+                        .args([
+                            "-o",
+                            tmp_file.to_str().unwrap(),
+                            "-d",
+                            tmp_dir.to_str().unwrap(),
+                        ])
+                        .status();
+                    if st2.as_ref().map(|s| s.success()).unwrap_or(false) {
+                        if let Some(found) = find_in_dir(&tmp_dir, "syftbox") {
+                            fs::rename(&found, &bin_path)?;
+                            let _ = fs::remove_dir_all(&tmp_dir);
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let mut perm = fs::metadata(&bin_path)?.permissions();
+                                perm.set_mode(0o755);
+                                fs::set_permissions(&bin_path, perm)?;
+                            }
+                            return Ok(bin_path);
+                        }
+                    }
+                } else {
+                    // Assume it's the binary itself
+                    fs::rename(&tmp_file, &bin_path)?;
+                    let _ = fs::remove_dir_all(&tmp_dir);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mut perm = fs::metadata(&bin_path)?.permissions();
+                        perm.set_mode(0o755);
+                        fs::set_permissions(&bin_path, perm)?;
+                    }
+                    return Ok(bin_path);
+                }
+            }
+        } else if let Err(e) = status {
+            last_err = Some(anyhow::anyhow!("curl failed: {}", e));
+        }
+    }
+    let _ = fs::remove_dir_all(&tmp_dir);
+    if let Some(e) = last_err {
+        Err(e)
+    } else {
+        let (os2, arch2) = current_os_arch();
+        Err(anyhow::anyhow!(
+            "Failed to download syftbox {} for {}-{}",
+            version,
+            os2,
+            arch2
+        ))
+    }
+}
+
+fn github_release_asset_for(version: &str) -> Option<(String, String)> {
+    // Use GitHub API to get assets for the tag and choose the best match
+    let url = format!(
+        "https://api.github.com/repos/OpenMined/syftbox/releases/tags/v{}",
+        version
+    );
+    let out = Command::new("curl")
+        .args(["-sL", "-H", "User-Agent: sbenv", &url])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let assets = v.get("assets")?.as_array()?;
+    let (os, arch) = current_os_arch();
+    let os_tokens = match os.as_str() {
+        "darwin" => vec!["darwin", "macos", "osx", "apple-darwin"],
+        "linux" => vec!["linux", "gnu", "musl", "linux-gnu"],
+        other => vec![other],
+    };
+    let arch_tokens = match arch.as_str() {
+        "arm64" => vec!["arm64", "aarch64"],
+        "x86_64" => vec!["x86_64", "amd64"],
+        other => vec![other],
+    };
+    let mut best: Option<(String, String, i32)> = None; // (url, name, score)
+    for a in assets {
+        let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let url = a
+            .get("browser_download_url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("");
+        let lname = name.to_lowercase();
+        if !lname.contains("syftbox") {
+            continue;
+        }
+        if !os_tokens.iter().any(|t| lname.contains(t)) {
+            continue;
+        }
+        if !arch_tokens.iter().any(|t| lname.contains(t)) {
+            continue;
+        }
+        let score = if lname.ends_with(".tar.gz") || lname.ends_with(".tgz") {
+            3
+        } else if lname.ends_with(".zip") {
+            2
+        } else {
+            1
+        };
+        match &best {
+            None => best = Some((url.to_string(), name.to_string(), score)),
+            Some((_, _, bs)) if score > *bs => {
+                best = Some((url.to_string(), name.to_string(), score))
+            }
+            _ => {}
+        }
+        if score == 3 {
+            // Good enough
+            break;
+        }
+    }
+    best.map(|(u, n, _)| (u, n))
+}
+
+fn install_syftbox_from_download(
+    tmp_file: &Path,
+    asset_name: &str,
+    tmp_dir: &Path,
+    bin_path: &Path,
+) -> Result<()> {
+    let lname = asset_name.to_lowercase();
+    if lname.ends_with(".tar.gz") || lname.ends_with(".tgz") {
+        let st2 = Command::new("tar")
+            .args([
+                "-xzf",
+                tmp_file.to_str().unwrap(),
+                "-C",
+                tmp_dir.to_str().unwrap(),
+            ])
+            .status()?;
+        if !st2.success() {
+            return Err(anyhow::anyhow!("Failed to extract tar.gz"));
+        }
+        let found = find_in_dir(tmp_dir, "syftbox")
+            .ok_or_else(|| anyhow::anyhow!("syftbox binary not found in archive"))?;
+        fs::rename(&found, &bin_path)?;
+    } else if lname.ends_with(".zip") {
+        let st2 = Command::new("unzip")
+            .args([
+                "-o",
+                tmp_file.to_str().unwrap(),
+                "-d",
+                tmp_dir.to_str().unwrap(),
+            ])
+            .status()?;
+        if !st2.success() {
+            return Err(anyhow::anyhow!("Failed to unzip asset"));
+        }
+        let found = find_in_dir(tmp_dir, "syftbox")
+            .ok_or_else(|| anyhow::anyhow!("syftbox binary not found in zip"))?;
+        fs::rename(&found, &bin_path)?;
+    } else {
+        // Assume it's the binary itself
+        fs::rename(&tmp_file, &bin_path)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(&bin_path)?.permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&bin_path, perm)?;
+    }
+    Ok(())
+}
+
+fn find_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if let Ok(read) = fs::read_dir(&d) {
+            for e in read.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p.clone());
+                }
+                if p.file_name().and_then(|n| n.to_str()) == Some(name) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_or_install_syftbox(spec: &str) -> Result<(PathBuf, Option<String>)> {
+    // If spec parses as semver => version
+    if Version::parse(spec).is_ok() {
+        let bin = ensure_syftbox_version(spec)?;
+        let ver = detect_binary_version(&bin);
+        return Ok((bin, ver));
+    }
+    // Otherwise treat as path
+    let p = PathBuf::from(spec);
+    let path = if p.is_absolute() || p.exists() {
+        p
+    } else {
+        // Fallback: try PATH command name
+        which_syftbox().unwrap_or_else(|| PathBuf::from("syftbox"))
+    };
+    let ver = detect_binary_version(&path);
+    Ok((path, ver))
+}
+
+fn detect_binary_version(bin: &Path) -> Option<String> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_syftbox_version_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn resolve_binary_for_env(config_path: &Path) -> Result<(PathBuf, Option<String>)> {
+    // Prefer env-specific registry entry
+    let registry = load_registry()?;
+    let env_dir = config_path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let entry = registry.environments.values().find(|e| e.path == env_dir);
+    if let Some(info) = entry {
+        if let Some(ver) = &info.binary_version {
+            if Version::parse(ver).is_ok() {
+                let bin = ensure_syftbox_version(ver)?;
+                let v = detect_binary_version(&bin).or_else(|| Some(ver.clone()));
+                return Ok((bin, v));
+            }
+        }
+        if let Some(b) = &info.binary {
+            let p = PathBuf::from(b);
+            return Ok((p.clone(), detect_binary_version(&p)));
+        }
+    }
+    // Fallback to global default
+    let gc = load_global_config();
+    if let Some(spec) = gc.default_binary {
+        return resolve_or_install_syftbox(&spec);
+    }
+    // Fallback to PATH
+    if let Some(p) = which_syftbox() {
+        return Ok((p.clone(), detect_binary_version(&p)));
+    }
+    // Final fallback: plain name (might fail at runtime)
+    Ok((PathBuf::from("syftbox"), None))
+}
+
+fn ensure_env_has_binary(env_dir: &Path) -> Result<()> {
+    let env_name = env_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut registry = load_registry()?;
+    if let Some(info) = registry.environments.get_mut(&env_name) {
+        if info.binary.is_none() && info.binary_version.is_none() {
+            let gc = load_global_config();
+            if let Some(spec) = gc.default_binary {
+                let (p, v) = resolve_or_install_syftbox(&spec)?;
+                info.binary = Some(p.to_string_lossy().to_string());
+                info.binary_version = v.clone();
+                let d = detect_binary_details(&p);
+                info.binary_hash = d.hash;
+                info.binary_os = d.os;
+                info.binary_arch = d.arch;
+                save_registry(&registry)?;
+            } else if let Some(p) = which_syftbox() {
+                info.binary = Some(p.to_string_lossy().to_string());
+                let d = detect_binary_details(&p);
+                info.binary_version = d.version;
+                info.binary_hash = d.hash;
+                info.binary_os = d.os;
+                info.binary_arch = d.arch;
+                save_registry(&registry)?;
+            }
+        }
+    }
+    Ok(())
+}
 fn find_syftbox_config(start_dir: &Path) -> Option<PathBuf> {
     let mut current = start_dir.to_path_buf();
     loop {
@@ -253,7 +811,12 @@ fn load_config(config_path: &Path) -> Result<SyftBoxConfig> {
     Ok(config)
 }
 
-fn init_environment(email: Option<String>, server_url: Option<String>, dev: bool) -> Result<()> {
+fn init_environment_with_binary(
+    email: Option<String>,
+    server_url: Option<String>,
+    dev: bool,
+    binary: Option<String>,
+) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let syftbox_dir = current_dir.join(".syftbox");
 
@@ -306,12 +869,57 @@ fn init_environment(email: Option<String>, server_url: Option<String>, dev: bool
 
     register_environment(&current_dir, &config)?;
 
+    // Resolve and persist binary preference
+    if let Some(bin_spec) = binary {
+        let (bin_path, bin_ver) = resolve_or_install_syftbox(&bin_spec)?;
+        // Update registry entry
+        let mut registry = load_registry()?;
+        let env_key = current_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        if let Some(info) = registry.environments.get_mut(env_key) {
+            info.binary = Some(bin_path.to_string_lossy().to_string());
+            info.binary_version = bin_ver;
+            let d = detect_binary_details(&bin_path);
+            info.binary_hash = d.hash;
+            info.binary_os = d.os;
+            info.binary_arch = d.arch;
+        }
+        save_registry(&registry)?;
+
+        // Save as global default for future envs
+        let mut gc = load_global_config();
+        gc.default_binary = Some(bin_spec);
+        let _ = save_global_config(&gc);
+    } else {
+        // If no spec, ensure global default exists (noop if not set)
+        let _ = ensure_env_has_binary(&current_dir);
+    }
+
+    // Write a marker file so other tools can detect the environment
+    let marker_path = current_dir.join(".sbenv");
+    if !marker_path.exists() {
+        let marker_content = format!(
+            "{{\n  \"email\": \"{}\",\n  \"port\": {},\n  \"server_url\": \"{}\"\n}}\n",
+            email, port, resolved_server_url
+        );
+        fs::write(&marker_path, marker_content).context("Failed to write .sbenv marker file")?;
+    }
+
     println!("{}", "✅ SyftBox environment initialized!".green().bold());
     println!();
     println!("📧 Email: {}", email.cyan());
     println!("🌐 Server: {}", resolved_server_url.cyan());
     println!("📁 Data dir: {}", current_dir.display().to_string().cyan());
     println!("🔌 Client port: {}", port.to_string().cyan());
+    // Show resolved binary information
+    if let Ok((bin_path, bin_ver)) = resolve_binary_for_env(&config_path) {
+        println!("🛠 Binary: {}", bin_path.display().to_string().cyan());
+        if let Some(v) = bin_ver {
+            println!("🔢 Version: {}", v.cyan());
+        }
+    }
     println!();
     println!("Run {} to see this info again", "sbenv info".yellow());
     println!(
@@ -363,6 +971,21 @@ fn show_info() -> Result<()> {
         config_path.display().to_string().cyan()
     );
 
+    // Show binary details resolved for this environment
+    if let Ok((bin_path, bin_ver)) = resolve_binary_for_env(&config_path) {
+        println!("🛠 Binary: {}", bin_path.display().to_string().cyan());
+        if let Some(v) = bin_ver {
+            println!("🔢 Version: {}", v.cyan());
+        }
+        let d = detect_binary_details(&bin_path);
+        if let Some(h) = d.hash {
+            println!("    Hash: {}", h.cyan());
+        }
+        if let (Some(os), Some(arch)) = (d.os, d.arch) {
+            println!("    Target: {}/{}", os.cyan(), arch.cyan());
+        }
+    }
+
     // Show raw config.json content
     println!();
     println!("{}", "── Config File Content ──".dimmed());
@@ -403,6 +1026,22 @@ fn show_info() -> Result<()> {
                 "disabled".dimmed()
             }
         );
+        if let Some(b) = &env_info.binary {
+            println!("🛠  Binary: {}", b.cyan());
+        }
+        if let Some(v) = &env_info.binary_version {
+            println!("    Version: {}", v.cyan());
+        }
+        if let Some(h) = &env_info.binary_hash {
+            println!("    Hash: {}", h.cyan());
+        }
+        if env_info.binary_os.is_some() || env_info.binary_arch.is_some() {
+            println!(
+                "    Target: {}/{}",
+                env_info.binary_os.as_deref().unwrap_or("?"),
+                env_info.binary_arch.as_deref().unwrap_or("?")
+            );
+        }
     } else {
         println!("⚠️  Not registered in global sbenv");
         println!("   Run {} to register", "sbenv init".yellow());
@@ -430,6 +1069,9 @@ fn activate_environment(quiet: bool) -> Result<()> {
 
     let config = load_config(&config_path)?;
 
+    // Ensure .sbenv marker exists for this environment
+    let _ = ensure_marker_exists(&config_path, &config);
+
     if !quiet {
         println!("# Run this command to activate the environment:");
         println!("# eval \"$(sbenv activate)\"");
@@ -442,6 +1084,20 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!("export SYFTBOX_CONFIG_PATH=\"{}\"", config_path.display());
     if let Some(url) = &config.client_url {
         println!("export SYFTBOX_CLIENT_URL=\"{}\"", url);
+    }
+    // Resolve syftbox binary + version for this env (fallback to 'syftbox')
+    let (bin_path, bin_ver) =
+        resolve_binary_for_env(&config_path).unwrap_or((PathBuf::from("syftbox"), None));
+    println!("export SYFTBOX_BINARY=\"{}\"", bin_path.display());
+    if let Some(v) = bin_ver {
+        println!("export SYFTBOX_VERSION=\"{}\"", v);
+    }
+    let d = detect_binary_details(&bin_path);
+    if let Some(h) = d.hash {
+        println!("export SYFTBOX_BUILD_HASH=\"{}\"", h);
+    }
+    if let (Some(os), Some(arch)) = (d.os, d.arch) {
+        println!("export SYFTBOX_BUILD_TARGET=\"{}/{}\"", os, arch);
     }
     println!("export SYFTBOX_ENV_ACTIVE=\"1\"");
 
@@ -492,11 +1148,6 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!("    fi");
     println!("fi");
 
-    println!(
-        "echo \"SyftBox environment activated: {}\" >&2",
-        config.email
-    );
-
     // Force Powerlevel10k to refresh if it's running
     println!("if typeset -f _p9k_precmd >/dev/null 2>&1; then");
     println!("    _p9k_precmd");
@@ -518,6 +1169,10 @@ fn deactivate_environment(quiet: bool) -> Result<()> {
     println!("unset SYFTBOX_CONFIG_PATH");
     println!("unset SYFTBOX_CLIENT_URL");
     println!("unset SYFTBOX_ENV_NAME");
+    println!("unset SYFTBOX_BINARY");
+    println!("unset SYFTBOX_VERSION");
+    println!("unset SYFTBOX_BUILD_HASH");
+    println!("unset SYFTBOX_BUILD_TARGET");
 
     // Restore VIRTUAL_ENV
     println!("if [ -n \"$SYFTBOX_OLD_VIRTUAL_ENV\" ]; then");
@@ -560,7 +1215,7 @@ fn deactivate_environment(quiet: bool) -> Result<()> {
     println!("fi");
 
     println!("unset SYFTBOX_ENV_ACTIVE");
-    println!("echo \"SyftBox environment deactivated\" >&2");
+    // No console I/O here to avoid conflicts with instant prompt
 
     Ok(())
 }
@@ -590,6 +1245,11 @@ fn remove_environment(path: Option<PathBuf>) -> Result<()> {
         if confirmation {
             unregister_environment(&target_path)?;
             fs::remove_dir_all(&syftbox_dir).context("Failed to remove .syftbox directory")?;
+            // Remove marker file if present
+            let marker = target_path.join(".sbenv");
+            if marker.exists() {
+                fs::remove_file(marker).ok();
+            }
             println!("{}", "✅ SyftBox environment removed".green());
         } else {
             println!("{}", "Cancelled".yellow());
@@ -608,6 +1268,9 @@ fn activate_environment_to_file(path: &Path) -> Result<()> {
     })?;
 
     let config = load_config(&config_path)?;
+
+    // Ensure .sbenv marker exists for this environment
+    let _ = ensure_marker_exists(&config_path, &config);
 
     let env_name = Path::new(&config.data_dir)
         .file_name()
@@ -630,6 +1293,15 @@ fn activate_environment_to_file(path: &Path) -> Result<()> {
     ));
     if let Some(url) = &config.client_url {
         script.push_str(&format!("export SYFTBOX_CLIENT_URL=\"{}\"\n", url));
+    }
+    let (bin_path, bin_ver) =
+        resolve_binary_for_env(&config_path).unwrap_or((PathBuf::from("syftbox"), None));
+    script.push_str(&format!(
+        "export SYFTBOX_BINARY=\"{}\"\n",
+        bin_path.display()
+    ));
+    if let Some(v) = bin_ver {
+        script.push_str(&format!("export SYFTBOX_VERSION=\"{}\"\n", v));
     }
     script.push_str("export SYFTBOX_ENV_ACTIVE=\"1\"\n");
     script.push_str(&format!("export SYFTBOX_ENV_NAME=\"{}\"\n", env_name));
@@ -685,6 +1357,24 @@ fn check_shell_functions_installed(rc_file: &Path) -> Result<bool> {
     for line in reader.lines() {
         let line = line?;
         if line.contains("# SyftBox environment functions") || line.contains("sbenv()") {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn check_auto_activation_installed(rc_file: &Path) -> Result<bool> {
+    if !rc_file.exists() {
+        return Ok(false);
+    }
+
+    let file = fs::File::open(rc_file)?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.contains("_sbenv_auto_hook") || line.contains("Auto-activate SyftBox envs") {
             return Ok(true);
         }
     }
@@ -853,6 +1543,63 @@ fn get_shell_functions() -> String {
     functions
 }
 
+fn get_auto_activation_block() -> String {
+    let mut s = String::new();
+    s.push_str("# Auto-activate SyftBox envs when entering directories with a .sbenv marker\n");
+    s.push_str("_sbenv_find_root() {\n");
+    s.push_str("    local dir=\"$PWD\"\n");
+    s.push_str("    while [ \"$dir\" != \"/\" ]; do\n");
+    s.push_str("        if [ -f \"$dir/.sbenv\" ]; then\n");
+    s.push_str("            echo \"$dir\"\n");
+    s.push_str("            return 0\n");
+    s.push_str("        fi\n");
+    s.push_str("        dir=\"$(dirname \"$dir\")\"\n");
+    s.push_str("    done\n");
+    s.push_str("    return 1\n");
+    s.push_str("}\n");
+    s.push('\n');
+    s.push_str("_sbenv_auto_hook() {\n");
+    s.push_str("    local root\n");
+    s.push_str("    root=\"$(_sbenv_find_root 2>/dev/null)\"\n");
+    s.push_str("    if [ -n \"$root\" ]; then\n");
+    s.push_str("        if [ \"$SBENV_AUTO_ACTIVE_ROOT\" != \"$root\" ]; then\n");
+    s.push_str("            if [ -n \"$SYFTBOX_ENV_ACTIVE\" ]; then\n");
+    s.push_str(
+        "                SBENV_SUPPRESS_MESSAGES=1 eval \"$(command sbenv deactivate --quiet)\"\n",
+    );
+    s.push_str("            fi\n");
+    s.push_str(
+        "            SBENV_SUPPRESS_MESSAGES=1 eval \"$(command sbenv activate --quiet)\"\n",
+    );
+    s.push_str("            export SBENV_AUTO_ACTIVE_ROOT=\"$root\"\n");
+    s.push_str("        fi\n");
+    s.push_str("    else\n");
+    s.push_str(
+        "        if [ -n \"$SBENV_AUTO_ACTIVE_ROOT\" ] && [ -n \"$SYFTBOX_ENV_ACTIVE\" ]; then\n",
+    );
+    s.push_str(
+        "            SBENV_SUPPRESS_MESSAGES=1 eval \"$(command sbenv deactivate --quiet)\"\n",
+    );
+    s.push_str("            unset SBENV_AUTO_ACTIVE_ROOT\n");
+    s.push_str("        fi\n");
+    s.push_str("    fi\n");
+    s.push_str("}\n");
+    s.push('\n');
+    s.push_str("# Hook into ZSH bash-style directory change or Bash prompt\n");
+    s.push_str("if [ -n \"$ZSH_VERSION\" ]; then\n");
+    s.push_str("    typeset -ga chpwd_functions\n");
+    s.push_str("    case \" ${chpwd_functions[@]} \" in *\\ _sbenv_auto_hook\\ *) ;; *) chpwd_functions+=(_sbenv_auto_hook) ;; esac\n");
+    s.push_str("    _sbenv_auto_hook\n");
+    s.push_str("else\n");
+    s.push_str("    if [ -z \"$SBENV_AUTO_PROMPT_HOOK\" ]; then\n");
+    s.push_str("        export PROMPT_COMMAND=\"_sbenv_auto_hook; ${PROMPT_COMMAND}\"\n");
+    s.push_str("        export SBENV_AUTO_PROMPT_HOOK=1\n");
+    s.push_str("    fi\n");
+    s.push_str("    _sbenv_auto_hook\n");
+    s.push_str("fi\n");
+    s
+}
+
 fn install_shell_functions() -> Result<()> {
     let shell = env::var("SHELL").unwrap_or_else(|_| String::from("/bin/bash"));
     let shell_name = if shell.contains("zsh") {
@@ -874,23 +1621,35 @@ fn install_shell_functions() -> Result<()> {
     );
     println!();
 
-    // Check if already installed
-    if check_shell_functions_installed(&rc_file)? {
+    // Determine what needs to be added
+    let already_funcs = check_shell_functions_installed(&rc_file)?;
+    let already_auto = check_auto_activation_installed(&rc_file)?;
+
+    if already_funcs && already_auto {
         println!(
             "{}",
-            "✅ SyftBox shell functions are already installed!".green()
+            "✅ SyftBox shell functions and auto-activation are already installed!".green()
         );
-        println!("The 'sbenv' command wrapper and aliases are ready to use.");
-        println!();
+        println!("All helpers are ready to use.");
         println!("If you haven't reloaded your shell config, run:");
         println!("  {}", format!("source {}", rc_file.display()).yellow());
         return Ok(());
     }
 
+    let mut to_add = String::new();
+    if !already_funcs {
+        to_add.push_str(&get_shell_functions());
+        to_add.push('\n');
+    }
+    if !already_auto {
+        to_add.push_str(&get_auto_activation_block());
+        to_add.push('\n');
+    }
+
     // Show what will be added
     println!("The following will be added to your {} file:", shell_name);
     println!("{}", "─".repeat(50).dimmed());
-    print!("{}", get_shell_functions().dimmed());
+    print!("{}", to_add.dimmed());
     println!("{}", "─".repeat(50).dimmed());
     println!();
 
@@ -934,7 +1693,9 @@ fn install_shell_functions() -> Result<()> {
         existing_content.push('\n');
     }
 
-    existing_content.push_str(&get_shell_functions());
+    existing_content.push_str(&to_add);
+    existing_content.push('\n');
+    existing_content.push_str(&get_auto_activation_block());
 
     fs::write(&rc_file, existing_content)?;
 
@@ -1010,7 +1771,8 @@ fn prompt_and_login(config_path: &Path) -> Result<()> {
     let original_config = load_config(config_path)?;
 
     println!("Logging in to SyftBox...");
-    let mut cmd = Command::new("syftbox");
+    let (bin, _) = resolve_binary_for_env(config_path)?;
+    let mut cmd = Command::new(bin);
     let status = cmd
         .args(["-c", config_path.to_str().unwrap(), "login"])
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
@@ -1232,9 +1994,10 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
     }
 
     // Background execution using nohup for both modes; write output to log file
+    let (bin, _) = resolve_binary_for_env(&config_path)?;
     let mut nohup = Command::new("nohup");
     let child = nohup
-        .arg("syftbox")
+        .arg(bin.to_str().unwrap())
         .args(&syftbox_args)
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
@@ -1392,6 +2155,9 @@ fn show_daemon_status() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No SyftBox environment found"))?;
 
     let config = load_config(&config_path)?;
+
+    // Ensure .sbenv marker exists for this environment
+    let _ = ensure_marker_exists(&config_path, &config);
     // Always use the environment directory for PID file
     let env_dir = config_path.parent().unwrap().parent().unwrap();
     let pid_file = env_dir.join(".syftbox").join("syftbox.pid");
@@ -1596,7 +2362,8 @@ fn login_to_syftbox() -> Result<()> {
     println!("  Config: {}", config_path.display().to_string().cyan());
     println!();
 
-    let mut cmd = Command::new("syftbox");
+    let (bin, _) = resolve_binary_for_env(&config_path)?;
+    let mut cmd = Command::new(bin);
     let status = cmd
         .args(["-c", config_path.to_str().unwrap(), "login"])
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
@@ -1642,21 +2409,79 @@ fn list_environments() -> Result<()> {
     println!("{}", "📦 SyftBox Environments".bold());
     println!();
 
-    for (name, info) in &registry.environments {
+    // Collect and sort by email (case-insensitive)
+    let mut envs: Vec<&EnvInfo> = registry.environments.values().collect();
+    envs.sort_by(|a, b| a.email.to_lowercase().cmp(&b.email.to_lowercase()));
+
+    for info in envs {
         let path = Path::new(&info.path);
         let exists = path.join(".syftbox").exists();
         let status = if exists { "✅".green() } else { "❌".red() };
+        let top_name = Path::new(&info.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?");
+        let dev_label = if info.dev_mode { " - DEV" } else { "" };
 
-        println!("  {} {} ({})", status, name.cyan(), info.email);
+        // Primary line: status + email [ - DEV ] (top folder name)
+        println!(
+            "  {} {}{} ({})",
+            status,
+            info.email.cyan(),
+            dev_label,
+            top_name
+        );
         println!("     Path : {}", info.path);
         println!("     Port : {}", info.port);
         if !info.server_url.is_empty() {
             println!("     Server: {}", info.server_url);
         }
-        println!(
-            "     Dev  : {}",
-            if info.dev_mode { "true" } else { "false" }
-        );
+        if let Some(b) = &info.binary {
+            println!("     Bin  : {}", b);
+        }
+        if let Some(v) = &info.binary_version {
+            println!("     Ver  : {}", v);
+        }
+        if let Some(h) = &info.binary_hash {
+            println!("     Hash : {}", h);
+        }
+        if info.binary_os.is_some() || info.binary_arch.is_some() {
+            println!(
+                "     Target: {}/{}",
+                info.binary_os.as_deref().unwrap_or("?"),
+                info.binary_arch.as_deref().unwrap_or("?")
+            );
+        }
+
+        // Show process info (last known PID and whether it's active)
+        let pid_file = path.join(".syftbox").join("syftbox.pid");
+        if pid_file.exists() {
+            match fs::read_to_string(&pid_file) {
+                Ok(pid_str) => {
+                    let pid_str = pid_str.trim().to_string();
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        let check = Command::new("ps")
+                            .args(["-p", &pid.to_string()])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                        let running = matches!(check, Ok(s) if s.success());
+                        if running {
+                            println!("     PID  : {} (active)", pid.to_string().cyan());
+                        } else {
+                            println!("     PID  : {} (stale)", pid.to_string().yellow());
+                        }
+                    } else {
+                        println!("     PID  : {}", "invalid".red());
+                    }
+                }
+                Err(_) => {
+                    println!("     PID  : {}", "unreadable".red());
+                }
+            }
+        } else {
+            println!("     PID  : {}", "-".dimmed());
+        }
         println!();
     }
 
@@ -1934,8 +2759,9 @@ fn main() -> Result<()> {
             email,
             server_url,
             dev,
+            binary,
         }) => {
-            init_environment(email.clone(), server_url.clone(), *dev)?;
+            init_environment_with_binary(email.clone(), server_url.clone(), *dev, binary.clone())?;
         }
         Some(Commands::Info) => {
             show_info()?;
@@ -1953,8 +2779,39 @@ fn main() -> Result<()> {
         Some(Commands::Remove { path }) => {
             remove_environment(path.clone())?;
         }
-        Some(Commands::Edit { server_url, dev }) => {
+        Some(Commands::Edit {
+            server_url,
+            dev,
+            binary,
+        }) => {
             update_environment(server_url.clone(), *dev)?;
+            if let Some(bin_spec) = binary.clone() {
+                // Update binary for current env and save to registry; also update global default
+                let current_dir = env::current_dir().context("Failed to get current directory")?;
+                let config_path = find_syftbox_config(&current_dir).ok_or_else(|| {
+                    anyhow::anyhow!("No SyftBox environment found in current directory or parents")
+                })?;
+                let env_dir = config_path.parent().unwrap().parent().unwrap();
+                let env_name = env_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let (p, v) = resolve_or_install_syftbox(&bin_spec)?;
+                let mut registry = load_registry()?;
+                if let Some(info) = registry.environments.get_mut(&env_name) {
+                    info.binary = Some(p.to_string_lossy().to_string());
+                    info.binary_version = v.clone();
+                }
+                save_registry(&registry)?;
+                let mut gc = load_global_config();
+                gc.default_binary = Some(bin_spec);
+                let _ = save_global_config(&gc);
+                println!(
+                    "{}",
+                    "✅ Updated syftbox binary for this environment".green()
+                );
+            }
         }
         Some(Commands::InstallShell { manual }) => {
             if *manual {
@@ -1962,6 +2819,8 @@ fn main() -> Result<()> {
                 println!("# For ZSH: add to ~/.zshrc");
                 println!("# For Bash: add to ~/.bashrc");
                 print!("{}", get_shell_functions());
+                println!();
+                print!("{}", get_auto_activation_block());
                 println!();
                 println!("After adding these functions, restart your shell or run:");
                 println!("  source ~/.zshrc  # for ZSH");
