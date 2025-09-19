@@ -238,6 +238,14 @@ fn find_available_port() -> Result<u16> {
     Err(anyhow::anyhow!("No available ports in range 7939-7999"))
 }
 
+fn generate_env_key(path: &Path, email: &str) -> String {
+    // Create a unique key using email and absolute path
+    // This ensures multiple environments with same directory name don't conflict
+    let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let path_str = abs_path.to_string_lossy();
+    format!("{}@{}", email, path_str)
+}
+
 fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
     let mut registry = load_registry()?;
 
@@ -247,6 +255,8 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         .unwrap_or("unknown")
         .to_string();
 
+    let key = generate_env_key(path, &config.email);
+
     let port = config
         .client_url
         .as_deref()
@@ -255,7 +265,7 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         .unwrap_or(0);
 
     // Preserve existing binary info if present
-    let existing = registry.environments.get(&name).cloned();
+    let existing = registry.environments.get(&key).cloned();
     let env_info = EnvInfo {
         path: path.to_string_lossy().to_string(),
         email: config.email.clone(),
@@ -270,7 +280,7 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         binary_arch: existing.as_ref().and_then(|e| e.binary_arch.clone()),
     };
 
-    registry.environments.insert(name, env_info);
+    registry.environments.insert(key, env_info);
     save_registry(&registry)?;
     Ok(())
 }
@@ -309,20 +319,45 @@ fn ensure_marker_exists(config_path: &Path, config: &SyftBoxConfig) -> Result<()
         let registry = load_registry().unwrap_or(EnvRegistry {
             environments: HashMap::new(),
         });
-        let env_dir_str = env_dir.to_string_lossy().to_string();
+        let env_key = generate_env_key(env_dir, &config.email);
         registry
             .environments
-            .values()
-            .find(|info| info.path == env_dir_str)
+            .get(&env_key)
             .map(|info| info.port)
             .unwrap_or(0)
     };
 
-    let obj = serde_json::json!({
+    // Get binary info from registry if available
+    let registry = load_registry().unwrap_or(EnvRegistry {
+        environments: HashMap::new(),
+    });
+    let env_key = generate_env_key(env_dir, &config.email);
+    let binary_info = registry.environments.get(&env_key);
+
+    let mut obj = serde_json::json!({
         "email": config.email,
         "port": port,
         "server_url": config.server_url,
     });
+
+    // Add binary fields if available
+    if let Some(info) = binary_info {
+        if let Some(b) = &info.binary {
+            obj["binary"] = serde_json::json!(b);
+        }
+        if let Some(v) = &info.binary_version {
+            obj["binary_version"] = serde_json::json!(v);
+        }
+        if let Some(h) = &info.binary_hash {
+            obj["binary_hash"] = serde_json::json!(h);
+        }
+        if let Some(o) = &info.binary_os {
+            obj["binary_os"] = serde_json::json!(o);
+        }
+        if let Some(a) = &info.binary_arch {
+            obj["binary_arch"] = serde_json::json!(a);
+        }
+    }
     let content = serde_json::to_string_pretty(&obj)? + "\n";
     fs::write(&marker, content)?;
     Ok(())
@@ -353,13 +388,15 @@ struct SyftboxDetails {
 
 fn parse_syftbox_details(output: &str) -> SyftboxDetails {
     // syftbox version 0.8.5 (26645a3; go1.24.3; darwin/arm64; 2025-09-16T04:17:56Z)
-    let mut det = SyftboxDetails::default();
-    det.version = parse_syftbox_version_output(output);
+    let mut det = SyftboxDetails {
+        version: parse_syftbox_version_output(output),
+        ..Default::default()
+    };
     if let Some(start) = output.find('(') {
         if let Some(end) = output[start + 1..].find(')') {
             let inner = &output[start + 1..start + 1 + end];
             let parts: Vec<&str> = inner.split(';').map(|s| s.trim()).collect();
-            if let Some(hash) = parts.get(0) {
+            if let Some(hash) = parts.first() {
                 if !hash.is_empty() {
                     det.hash = Some((*hash).to_string());
                 }
@@ -421,6 +458,7 @@ fn current_os_arch() -> (String, String) {
     (os.to_string(), arch.to_string())
 }
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 fn ensure_syftbox_version(version: &str) -> Result<PathBuf> {
     let bin_dir = get_binaries_dir().join(version);
     let bin_path = bin_dir.join("syftbox");
@@ -624,6 +662,7 @@ fn github_release_asset_for(version: &str) -> Option<(String, String)> {
     best.map(|(u, n, _)| (u, n))
 }
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 fn install_syftbox_from_download(
     tmp_file: &Path,
     asset_name: &str,
@@ -721,16 +760,14 @@ fn detect_binary_version(bin: &Path) -> Option<String> {
 }
 
 fn resolve_binary_for_env(config_path: &Path) -> Result<(PathBuf, Option<String>)> {
+    // Load config to get email for key generation
+    let config = load_config(config_path)?;
+
     // Prefer env-specific registry entry
     let registry = load_registry()?;
-    let env_dir = config_path
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    let entry = registry.environments.values().find(|e| e.path == env_dir);
+    let env_dir = config_path.parent().unwrap().parent().unwrap();
+    let env_key = generate_env_key(env_dir, &config.email);
+    let entry = registry.environments.get(&env_key);
     if let Some(info) = entry {
         if let Some(ver) = &info.binary_version {
             if Version::parse(ver).is_ok() {
@@ -757,14 +794,10 @@ fn resolve_binary_for_env(config_path: &Path) -> Result<(PathBuf, Option<String>
     Ok((PathBuf::from("syftbox"), None))
 }
 
-fn ensure_env_has_binary(env_dir: &Path) -> Result<()> {
-    let env_name = env_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+fn ensure_env_has_binary(env_dir: &Path, email: &str) -> Result<()> {
+    let env_key = generate_env_key(env_dir, email);
     let mut registry = load_registry()?;
-    if let Some(info) = registry.environments.get_mut(&env_name) {
+    if let Some(info) = registry.environments.get_mut(&env_key) {
         if info.binary.is_none() && info.binary_version.is_none() {
             let gc = load_global_config();
             if let Some(spec) = gc.default_binary {
@@ -874,11 +907,8 @@ fn init_environment_with_binary(
         let (bin_path, bin_ver) = resolve_or_install_syftbox(&bin_spec)?;
         // Update registry entry
         let mut registry = load_registry()?;
-        let env_key = current_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        if let Some(info) = registry.environments.get_mut(env_key) {
+        let env_key = generate_env_key(&current_dir, &email);
+        if let Some(info) = registry.environments.get_mut(&env_key) {
             info.binary = Some(bin_path.to_string_lossy().to_string());
             info.binary_version = bin_ver;
             let d = detect_binary_details(&bin_path);
@@ -894,18 +924,12 @@ fn init_environment_with_binary(
         let _ = save_global_config(&gc);
     } else {
         // If no spec, ensure global default exists (noop if not set)
-        let _ = ensure_env_has_binary(&current_dir);
+        let _ = ensure_env_has_binary(&current_dir, &email);
     }
 
     // Write a marker file so other tools can detect the environment
-    let marker_path = current_dir.join(".sbenv");
-    if !marker_path.exists() {
-        let marker_content = format!(
-            "{{\n  \"email\": \"{}\",\n  \"port\": {},\n  \"server_url\": \"{}\"\n}}\n",
-            email, port, resolved_server_url
-        );
-        fs::write(&marker_path, marker_content).context("Failed to write .sbenv marker file")?;
-    }
+    // This will include binary info if it was set in the registry
+    let _ = ensure_marker_exists(&config_path, &config);
 
     println!("{}", "✅ SyftBox environment initialized!".green().bold());
     println!();
@@ -1012,8 +1036,9 @@ fn show_info() -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
+    let env_key = generate_env_key(env_dir, &config.email);
 
-    if let Some(env_info) = registry.environments.get(env_name) {
+    if let Some(env_info) = registry.environments.get(&env_key) {
         println!("📝 Registered as: {}", env_name.cyan());
         println!("🏠 Location: {}", env_info.path.cyan());
         println!("🔗 Server: {}", env_info.server_url.cyan());
@@ -1148,9 +1173,9 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!("    fi");
     println!("fi");
 
-    // Force Powerlevel10k to refresh if it's running
-    println!("if typeset -f _p9k_precmd >/dev/null 2>&1; then");
-    println!("    _p9k_precmd");
+    // Set flag to refresh Powerlevel10k on next prompt (deferred to avoid instant prompt issues)
+    println!("if typeset -f p10k >/dev/null 2>&1; then");
+    println!("    export _SBENV_NEEDS_P10K_RELOAD=1");
     println!("fi");
 
     Ok(())
@@ -1384,6 +1409,27 @@ fn check_auto_activation_installed(rc_file: &Path) -> Result<bool> {
 
 fn get_shell_functions() -> String {
     let mut functions = String::new();
+
+    // Add P10k deferred reload handler
+    functions.push_str(
+        "# P10k deferred reload handler to avoid instant prompt issues
+_sbenv_p10k_precmd() {
+    if (( ${+functions[p10k]} )) && [[ -n $_SBENV_NEEDS_P10K_RELOAD ]]; then
+        unset _SBENV_NEEDS_P10K_RELOAD
+        p10k reload 2>/dev/null
+    fi
+}
+
+# Add to precmd hooks if in ZSH
+if [ -n \"$ZSH_VERSION\" ]; then
+    if (( ${+functions[add-zsh-hook]} )); then
+        autoload -Uz add-zsh-hook 2>/dev/null
+        add-zsh-hook precmd _sbenv_p10k_precmd 2>/dev/null
+    fi
+fi
+
+",
+    );
     functions.push_str(
         "
 # SyftBox environment functions
@@ -1429,19 +1475,15 @@ fn get_shell_functions() -> String {
 ",
     );
     functions.push_str(
+        "                # Defer P10k reload to avoid instant prompt issues
+",
+    );
+    functions.push_str(
         "                if typeset -f p10k >/dev/null 2>&1; then
 ",
     );
     functions.push_str(
-        "                    p10k reload 2>/dev/null
-",
-    );
-    functions.push_str(
-        "                elif typeset -f _p9k_precmd >/dev/null 2>&1; then
-",
-    );
-    functions.push_str(
-        "                    _p9k_precmd
+        "                    export _SBENV_NEEDS_P10K_RELOAD=1
 ",
     );
     functions.push_str(
@@ -1479,19 +1521,15 @@ fn get_shell_functions() -> String {
 ",
     );
     functions.push_str(
+        "                # Defer P10k reload to avoid instant prompt issues
+",
+    );
+    functions.push_str(
         "                if typeset -f p10k >/dev/null 2>&1; then
 ",
     );
     functions.push_str(
-        "                    p10k reload 2>/dev/null
-",
-    );
-    functions.push_str(
-        "                elif typeset -f _p9k_precmd >/dev/null 2>&1; then
-",
-    );
-    functions.push_str(
-        "                    _p9k_precmd
+        "                    export _SBENV_NEEDS_P10K_RELOAD=1
 ",
     );
     functions.push_str(
@@ -1589,13 +1627,15 @@ fn get_auto_activation_block() -> String {
     s.push_str("if [ -n \"$ZSH_VERSION\" ]; then\n");
     s.push_str("    typeset -ga chpwd_functions\n");
     s.push_str("    case \" ${chpwd_functions[@]} \" in *\\ _sbenv_auto_hook\\ *) ;; *) chpwd_functions+=(_sbenv_auto_hook) ;; esac\n");
-    s.push_str("    _sbenv_auto_hook\n");
+    s.push_str(
+        "    # Don't call _sbenv_auto_hook immediately - let it run on first directory change\n",
+    );
     s.push_str("else\n");
     s.push_str("    if [ -z \"$SBENV_AUTO_PROMPT_HOOK\" ]; then\n");
     s.push_str("        export PROMPT_COMMAND=\"_sbenv_auto_hook; ${PROMPT_COMMAND}\"\n");
     s.push_str("        export SBENV_AUTO_PROMPT_HOOK=1\n");
     s.push_str("    fi\n");
-    s.push_str("    _sbenv_auto_hook\n");
+    s.push_str("    # Don't call _sbenv_auto_hook immediately - let it run on first prompt\n");
     s.push_str("fi\n");
     s
 }
@@ -1722,6 +1762,22 @@ fn install_shell_functions() -> Result<()> {
     println!("  {} - Activate (shortcut)", "sba".cyan());
     println!("  {} - Deactivate (shortcut)", "sbd".cyan());
     println!("  {} - Show info (shortcut)", "sbi".cyan());
+    println!();
+    println!(
+        "{}",
+        "⚠️  Important for Powerlevel10k users:".yellow().bold()
+    );
+    println!(
+        "   Add this line at the END of your {} file:",
+        rc_file.display()
+    );
+    println!();
+    println!(
+        "   {}",
+        "(( ! ${+functions[p10k]} )) || p10k finalize".cyan()
+    );
+    println!();
+    println!("   This prevents instant prompt errors with sbenv auto-activation.");
 
     Ok(())
 }
@@ -2791,15 +2847,12 @@ fn main() -> Result<()> {
                 let config_path = find_syftbox_config(&current_dir).ok_or_else(|| {
                     anyhow::anyhow!("No SyftBox environment found in current directory or parents")
                 })?;
+                let config = load_config(&config_path)?;
                 let env_dir = config_path.parent().unwrap().parent().unwrap();
-                let env_name = env_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+                let env_key = generate_env_key(env_dir, &config.email);
                 let (p, v) = resolve_or_install_syftbox(&bin_spec)?;
                 let mut registry = load_registry()?;
-                if let Some(info) = registry.environments.get_mut(&env_name) {
+                if let Some(info) = registry.environments.get_mut(&env_key) {
                     info.binary = Some(p.to_string_lossy().to_string());
                     info.binary_version = v.clone();
                 }
@@ -2945,6 +2998,11 @@ mod tests {
                 name: format!("test{}", i),
                 server_url: "https://test.server".to_string(),
                 dev_mode: false,
+                binary: None,
+                binary_version: None,
+                binary_hash: None,
+                binary_os: None,
+                binary_arch: None,
             };
             registry.environments.insert(format!("test{}", i), env_info);
         }
@@ -2987,10 +3045,11 @@ mod tests {
         // Register environment
         register_environment(&test_path, &config).unwrap();
 
-        // Verify it was registered
+        // Verify it was registered using the correct key
         let registry = load_registry().unwrap();
-        assert!(registry.environments.contains_key("test_env"));
-        let env_info = registry.environments.get("test_env").unwrap();
+        let env_key = generate_env_key(&test_path, "test@example.com");
+        assert!(registry.environments.contains_key(&env_key));
+        let env_info = registry.environments.get(&env_key).unwrap();
         assert_eq!(env_info.email, "test@example.com");
         assert_eq!(env_info.port, 7950);
 
@@ -2999,7 +3058,7 @@ mod tests {
 
         // Verify it was removed
         let registry = load_registry().unwrap();
-        assert!(!registry.environments.contains_key("test_env"));
+        assert!(!registry.environments.contains_key(&env_key));
 
         if let Some(home) = original_home {
             env::set_var("HOME", home);
@@ -3043,6 +3102,11 @@ mod tests {
                 name: "env1".to_string(),
                 server_url: "https://test.server".to_string(),
                 dev_mode: false,
+                binary: None,
+                binary_version: None,
+                binary_hash: None,
+                binary_os: None,
+                binary_arch: None,
             },
         );
         registry.environments.insert(
@@ -3054,6 +3118,11 @@ mod tests {
                 name: "env2".to_string(),
                 server_url: "https://test.server".to_string(),
                 dev_mode: false,
+                binary: None,
+                binary_version: None,
+                binary_hash: None,
+                binary_os: None,
+                binary_arch: None,
             },
         );
 
@@ -3134,6 +3203,11 @@ mod tests {
                 name: "persistent_env".to_string(),
                 server_url: "https://test.server".to_string(),
                 dev_mode: false,
+                binary: None,
+                binary_version: None,
+                binary_hash: None,
+                binary_os: None,
+                binary_arch: None,
             },
         );
         save_registry(&registry).unwrap();
