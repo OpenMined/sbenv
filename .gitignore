@@ -21,3 +21,6 @@ target
 #.idea/
 
 .claude
+.sbenv
+.claude/*
+.syftbox/*
