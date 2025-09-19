@@ -44,6 +44,22 @@ struct EnvInfo {
     server_url: String,
     #[serde(default)]
     dev_mode: bool,
+    #[serde(default)]
+    binary: Option<String>,
+    #[serde(default)]
+    binary_version: Option<String>,
+    #[serde(default)]
+    binary_hash: Option<String>,
+    #[serde(default)]
+    binary_os: Option<String>,
+    #[serde(default)]
+    binary_arch: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct GlobalConfig {
+    #[serde(default)]
+    default_binary: Option<String>, // path or version
 }
 
 #[derive(Parser)]
@@ -67,6 +83,9 @@ enum Commands {
         /// Enable development mode defaults
         #[arg(long, default_value_t = false)]
         dev: bool,
+        /// Specify syftbox binary (path) or version (e.g. 0.8.5)
+        #[arg(long)]
+        binary: Option<String>,
     },
     /// Edit current environment settings (server URL, dev mode)
     Edit {
@@ -76,6 +95,9 @@ enum Commands {
         /// Toggle development mode on/off
         #[arg(long)]
         dev: Option<bool>,
+        /// Change syftbox binary (path) or version
+        #[arg(long)]
+        binary: Option<String>,
     },
     /// Display information about the current environment
     Info,
@@ -149,6 +171,11 @@ fn get_registry_path() -> PathBuf {
     Path::new(&home).join(".sbenv").join("envs.json")
 }
 
+fn get_global_config_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".sbenv").join("config.json")
+}
+
 fn load_registry() -> Result<EnvRegistry> {
     let registry_path = get_registry_path();
     if !registry_path.exists() {
@@ -168,6 +195,27 @@ fn save_registry(registry: &EnvRegistry) -> Result<()> {
     }
     let content = serde_json::to_string_pretty(&registry)?;
     fs::write(&registry_path, content)?;
+    Ok(())
+}
+
+fn load_global_config() -> GlobalConfig {
+    let path = get_global_config_path();
+    if !path.exists() {
+        return GlobalConfig::default();
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<GlobalConfig>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_global_config(cfg: &GlobalConfig) -> Result<()> {
+    let path = get_global_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let s = serde_json::to_string_pretty(cfg)?;
+    fs::write(path, s)?;
     Ok(())
 }
 
@@ -206,6 +254,8 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(0);
 
+    // Preserve existing binary info if present
+    let existing = registry.environments.get(&name).cloned();
     let env_info = EnvInfo {
         path: path.to_string_lossy().to_string(),
         email: config.email.clone(),
@@ -213,6 +263,11 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         name: name.clone(),
         server_url: config.server_url.clone(),
         dev_mode: config.dev_mode,
+        binary: existing.as_ref().and_then(|e| e.binary.clone()),
+        binary_version: existing.as_ref().and_then(|e| e.binary_version.clone()),
+        binary_hash: existing.as_ref().and_then(|e| e.binary_hash.clone()),
+        binary_os: existing.as_ref().and_then(|e| e.binary_os.clone()),
+        binary_arch: existing.as_ref().and_then(|e| e.binary_arch.clone()),
     };
 
     registry.environments.insert(name, env_info);
@@ -253,7 +308,7 @@ fn load_config(config_path: &Path) -> Result<SyftBoxConfig> {
     Ok(config)
 }
 
-fn init_environment(email: Option<String>, server_url: Option<String>, dev: bool) -> Result<()> {
+fn init_environment(email: Option<String>, server_url: Option<String>, dev: bool, binary: Option<String>) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let syftbox_dir = current_dir.join(".syftbox");
 
@@ -305,6 +360,26 @@ fn init_environment(email: Option<String>, server_url: Option<String>, dev: bool
     fs::write(&config_path, config_json).context("Failed to write config file")?;
 
     register_environment(&current_dir, &config)?;
+
+    // Handle binary specification if provided
+    if let Some(binary_spec) = binary {
+        let env_name = current_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let mut registry = load_registry()?;
+        if let Some(env_info) = registry.environments.get_mut(&env_name) {
+            // Check if it's a version or a path
+            if Version::parse(&binary_spec).is_ok() {
+                env_info.binary_version = Some(binary_spec.clone());
+            } else {
+                env_info.binary = Some(binary_spec.clone());
+            }
+            save_registry(&registry)?;
+        }
+    }
 
     println!("{}", "✅ SyftBox environment initialized!".green().bold());
     println!();
@@ -358,6 +433,30 @@ fn show_info() -> Result<()> {
             "disabled".dimmed()
         }
     );
+
+    // Show binary information from registry
+    let env_name = env_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let registry = load_registry().unwrap_or(EnvRegistry {
+        environments: HashMap::new(),
+    });
+    if let Some(env_info) = registry.environments.get(&env_name) {
+        if env_info.binary_version.is_some() || env_info.binary.is_some() {
+            println!(
+                "🚀 Binary: {}",
+                env_info.binary.as_deref()
+                    .or(env_info.binary_version.as_deref())
+                    .unwrap_or("not set").cyan()
+            );
+            if let Some(ver) = &env_info.binary_version {
+                println!("📌 Version: {}", ver.cyan());
+            }
+        }
+    }
+
     println!(
         "📄 Config path: {}",
         config_path.display().to_string().cyan()
@@ -1663,7 +1762,7 @@ fn list_environments() -> Result<()> {
     Ok(())
 }
 
-fn update_environment(server_url: Option<String>, dev: Option<bool>) -> Result<()> {
+fn update_environment(server_url: Option<String>, dev: Option<bool>, binary: Option<String>) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let config_path = find_syftbox_config(&current_dir).ok_or_else(|| {
         anyhow::anyhow!("No SyftBox environment found in current directory or parents")
@@ -1698,6 +1797,28 @@ fn update_environment(server_url: Option<String>, dev: Option<bool>) -> Result<(
     // Update environment registry (path is env dir of config)
     let env_dir = config_path.parent().unwrap().parent().unwrap();
     register_environment(env_dir, &config)?;
+
+    // Handle binary specification update if provided
+    if let Some(binary_spec) = binary {
+        let env_name = env_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let mut registry = load_registry()?;
+        if let Some(env_info) = registry.environments.get_mut(&env_name) {
+            // Check if it's a version or a path
+            if Version::parse(&binary_spec).is_ok() {
+                env_info.binary_version = Some(binary_spec.clone());
+                env_info.binary = None; // Clear path if setting version
+            } else {
+                env_info.binary = Some(binary_spec.clone());
+                env_info.binary_version = None; // Clear version if setting path
+            }
+            save_registry(&registry)?;
+        }
+    }
 
     println!("{}", "✅ Environment updated".green().bold());
     println!("  Email : {}", config.email.cyan());
@@ -1934,8 +2055,9 @@ fn main() -> Result<()> {
             email,
             server_url,
             dev,
+            binary,
         }) => {
-            init_environment(email.clone(), server_url.clone(), *dev)?;
+            init_environment(email.clone(), server_url.clone(), *dev, binary.clone())?;
         }
         Some(Commands::Info) => {
             show_info()?;
@@ -1953,8 +2075,8 @@ fn main() -> Result<()> {
         Some(Commands::Remove { path }) => {
             remove_environment(path.clone())?;
         }
-        Some(Commands::Edit { server_url, dev }) => {
-            update_environment(server_url.clone(), *dev)?;
+        Some(Commands::Edit { server_url, dev, binary }) => {
+            update_environment(server_url.clone(), *dev, binary.clone())?;
         }
         Some(Commands::InstallShell { manual }) => {
             if *manual {
@@ -2035,6 +2157,107 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn get_binaries_dir() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".sbenv").join("binaries")
+}
+
+fn parse_syftbox_version_output(output: &str) -> Option<String> {
+    // Expected: syftbox version 0.8.5 (...)
+    let lower = output.trim();
+    let parts: Vec<&str> = lower.split_whitespace().collect();
+    let idx = parts.iter().position(|p| *p == "version")?;
+    parts.get(idx + 1).map(|s| s.to_string())
+}
+
+#[derive(Debug, Clone, Default)]
+struct SyftboxDetails {
+    version: Option<String>,
+    hash: Option<String>,
+    go_version: Option<String>,
+    os: Option<String>,
+    arch: Option<String>,
+    build_time: Option<String>,
+}
+
+fn parse_syftbox_details(output: &str) -> SyftboxDetails {
+    // syftbox version 0.8.5 (26645a3; go1.24.3; darwin/arm64; 2025-09-16T04:17:56Z)
+    let mut det = SyftboxDetails::default();
+    det.version = parse_syftbox_version_output(output);
+    if let Some(start) = output.find('(') {
+        if let Some(end) = output[start + 1..].find(')') {
+            let inner = &output[start + 1..start + 1 + end];
+            let parts: Vec<&str> = inner.split(';').map(|s| s.trim()).collect();
+            if let Some(hash) = parts.get(0) {
+                if !hash.is_empty() {
+                    det.hash = Some((*hash).to_string());
+                }
+            }
+            if let Some(go) = parts.get(1) {
+                if !go.is_empty() {
+                    det.go_version = Some((*go).to_string());
+                }
+            }
+            if let Some(target) = parts.get(2) {
+                if let Some((os, arch)) = target.split_once('/') {
+                    det.os = Some(os.to_string());
+                    det.arch = Some(arch.to_string());
+                }
+            }
+            if let Some(bt) = parts.get(3) {
+                if !bt.is_empty() {
+                    det.build_time = Some((*bt).to_string());
+                }
+            }
+        }
+    }
+    det
+}
+
+fn detect_binary_details(bin: &Path) -> SyftboxDetails {
+    let out = Command::new(bin).arg("--version").output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            return parse_syftbox_details(&s);
+        }
+    }
+    SyftboxDetails::default()
+}
+
+fn which_syftbox() -> Option<PathBuf> {
+    let out = Command::new("which").arg("syftbox").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if p.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(p))
+    }
+}
+
+fn current_os_arch() -> (String, String) {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    (os.to_string(), arch.to_string())
+}
+
+fn detect_binary_version(bin: &Path) -> Option<String> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_syftbox_version_output(&String::from_utf8_lossy(&out.stdout))
 }
 
 #[cfg(test)]

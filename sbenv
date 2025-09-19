@@ -1,2 +1,5 @@
 #!/bin/bash
-cargo run --manifest-path ./cli/Cargo.toml "$@"
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Run cargo with the correct manifest path
+cargo run --manifest-path "$SCRIPT_DIR/cli/Cargo.toml" "$@"
