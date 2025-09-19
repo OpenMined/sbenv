@@ -86,6 +86,9 @@ enum Commands {
         /// Specify syftbox binary (path) or version (e.g. 0.8.5)
         #[arg(long)]
         binary: Option<String>,
+        /// Run in quiet mode, automatically accepting defaults
+        #[arg(short, long, default_value_t = false)]
+        quiet: bool,
     },
     /// Edit current environment settings (server URL, dev mode)
     Edit {
@@ -446,6 +449,145 @@ fn which_syftbox() -> Option<PathBuf> {
     }
 }
 
+fn get_cached_syftbox_versions() -> Vec<String> {
+    let bin_dir = get_binaries_dir();
+    if !bin_dir.exists() {
+        return Vec::new();
+    }
+
+    let mut versions = Vec::new();
+    if let Ok(entries) = fs::read_dir(&bin_dir) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_dir() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        // Check if there's actually a syftbox binary in this directory
+                        let bin_path = entry.path().join("syftbox");
+                        if bin_path.exists() {
+                            versions.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort versions in reverse order (newest first)
+    versions.sort_by(|a, b| match (Version::parse(a), Version::parse(b)) {
+        (Ok(va), Ok(vb)) => vb.cmp(&va),
+        _ => b.cmp(a),
+    });
+
+    versions
+}
+
+fn fetch_latest_syftbox_version() -> Result<String> {
+    let url = "https://api.github.com/repos/OpenMined/syftbox/releases/latest";
+    let out = Command::new("curl")
+        .args(["-sL", "-H", "User-Agent: sbenv", url])
+        .output()?;
+
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "Failed to fetch latest release info from GitHub"
+        ));
+    }
+
+    let body = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+
+    let tag = v
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Could not find tag_name in release"))?;
+
+    // Remove 'v' prefix if present
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+
+    Ok(version.to_string())
+}
+
+fn prompt_for_syftbox_install() -> Result<Option<String>> {
+    println!("{}", "⚠️  SyftBox is not installed in your PATH.".yellow());
+    println!();
+
+    // Check for cached versions
+    let cached_versions = get_cached_syftbox_versions();
+
+    // Try to fetch the latest version
+    let latest_version = fetch_latest_syftbox_version().ok();
+
+    if cached_versions.is_empty() && latest_version.is_none() {
+        println!(
+            "{}",
+            "❌ Could not fetch available versions and no cached versions found.".red()
+        );
+        println!("Please install syftbox manually or ensure internet connectivity.");
+        return Ok(None);
+    }
+
+    let mut options = Vec::new();
+
+    // Add latest version if available
+    if let Some(ref latest) = latest_version {
+        options.push(format!("Download latest version ({})", latest));
+    }
+
+    // Add cached versions
+    for version in &cached_versions {
+        options.push(format!("Use cached version {}", version));
+    }
+
+    options.push("Skip (I'll install it manually)".to_string());
+
+    println!("What would you like to do?");
+    println!();
+
+    for (i, option) in options.iter().enumerate() {
+        println!("  {}. {}", i + 1, option);
+    }
+    println!();
+
+    let selection = Input::<usize>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select an option")
+        .validate_with(|n: &usize| {
+            if *n > 0 && *n <= options.len() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Please enter a number between 1 and {}",
+                    options.len()
+                ))
+            }
+        })
+        .interact()?;
+
+    if selection == options.len() {
+        // User chose to skip
+        return Ok(None);
+    }
+
+    if let Some(ref latest) = latest_version {
+        if selection == 1 {
+            // Download latest version
+            return Ok(Some(latest.clone()));
+        }
+    }
+
+    // User selected a cached version
+    let cached_idx = if latest_version.is_some() {
+        selection - 2 // Adjust index if latest version was in the list
+    } else {
+        selection - 1
+    };
+
+    if cached_idx < cached_versions.len() {
+        Ok(Some(cached_versions[cached_idx].clone()))
+    } else {
+        Ok(None)
+    }
+}
+
 fn current_os_arch() -> (String, String) {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
@@ -463,9 +605,11 @@ fn ensure_syftbox_version(version: &str) -> Result<PathBuf> {
     let bin_dir = get_binaries_dir().join(version);
     let bin_path = bin_dir.join("syftbox");
     if bin_path.exists() {
+        println!("   Using cached syftbox version {}", version.cyan());
         return Ok(bin_path);
     }
 
+    println!("   Downloading syftbox version {}...", version.cyan());
     fs::create_dir_all(&bin_dir)?;
     let (os, arch) = current_os_arch();
     let base = format!(
@@ -849,6 +993,7 @@ fn init_environment_with_binary(
     server_url: Option<String>,
     dev: bool,
     binary: Option<String>,
+    quiet: bool,
 ) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let syftbox_dir = current_dir.join(".syftbox");
@@ -864,6 +1009,11 @@ fn init_environment_with_binary(
     let email = if let Some(email) = email {
         email
     } else {
+        if quiet {
+            return Err(anyhow::anyhow!(
+                "Email address is required when using --quiet flag. Use -e <email> to provide it."
+            ));
+        }
         Input::<String>::with_theme(&ColorfulTheme::default())
             .with_prompt("Email address")
             .interact_text()
@@ -902,9 +1052,52 @@ fn init_environment_with_binary(
 
     register_environment(&current_dir, &config)?;
 
+    // Check if syftbox is available, prompt for install if not
+    let binary_to_use = if binary.is_some() {
+        binary
+    } else {
+        // Check if syftbox is in PATH
+        let syftbox_in_path = which_syftbox().is_some();
+
+        if !syftbox_in_path {
+            if quiet {
+                // In quiet mode, automatically try to get the latest version
+                println!("📦 SyftBox not found in PATH. Fetching latest version...");
+                match fetch_latest_syftbox_version() {
+                    Ok(version) => Some(version),
+                    Err(e) => {
+                        // If we can't fetch latest, try to use a cached version
+                        let cached = get_cached_syftbox_versions();
+                        if !cached.is_empty() {
+                            println!("   Could not fetch latest version: {}", e);
+                            println!("   Using cached version: {}", cached[0]);
+                            Some(cached[0].clone())
+                        } else {
+                            println!("⚠️  Could not fetch latest version and no cached versions available");
+                            println!("   Error: {}", e);
+                            None
+                        }
+                    }
+                }
+            } else {
+                // Interactive mode - prompt user
+                // This will show cached versions and option to download latest
+                if let Ok(Some(version)) = prompt_for_syftbox_install() {
+                    Some(version)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // Resolve and persist binary preference
-    if let Some(bin_spec) = binary {
+    if let Some(bin_spec) = binary_to_use {
+        println!("📦 Setting up SyftBox binary...");
         let (bin_path, bin_ver) = resolve_or_install_syftbox(&bin_spec)?;
+        println!("✅ SyftBox binary configured successfully!");
         // Update registry entry
         let mut registry = load_registry()?;
         let env_key = generate_env_key(&current_dir, &email);
@@ -2816,8 +3009,15 @@ fn main() -> Result<()> {
             server_url,
             dev,
             binary,
+            quiet,
         }) => {
-            init_environment_with_binary(email.clone(), server_url.clone(), *dev, binary.clone())?;
+            init_environment_with_binary(
+                email.clone(),
+                server_url.clone(),
+                *dev,
+                binary.clone(),
+                *quiet,
+            )?;
         }
         Some(Commands::Info) => {
             show_info()?;
