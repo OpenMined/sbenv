@@ -601,15 +601,19 @@ fn current_os_arch() -> (String, String) {
 }
 
 #[allow(clippy::needless_borrows_for_generic_args)]
-fn ensure_syftbox_version(version: &str) -> Result<PathBuf> {
+fn ensure_syftbox_version(version: &str, quiet: bool) -> Result<PathBuf> {
     let bin_dir = get_binaries_dir().join(version);
     let bin_path = bin_dir.join("syftbox");
     if bin_path.exists() {
-        println!("   Using cached syftbox version {}", version.cyan());
+        if !quiet {
+            eprintln!("   Using cached syftbox version {}", version.cyan());
+        }
         return Ok(bin_path);
     }
 
-    println!("   Downloading syftbox version {}...", version.cyan());
+    if !quiet {
+        eprintln!("   Downloading syftbox version {}...", version.cyan());
+    }
     fs::create_dir_all(&bin_dir)?;
     let (os, arch) = current_os_arch();
     let base = format!(
@@ -876,10 +880,10 @@ fn find_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-fn resolve_or_install_syftbox(spec: &str) -> Result<(PathBuf, Option<String>)> {
+fn resolve_or_install_syftbox(spec: &str, quiet: bool) -> Result<(PathBuf, Option<String>)> {
     // If spec parses as semver => version
     if Version::parse(spec).is_ok() {
-        let bin = ensure_syftbox_version(spec)?;
+        let bin = ensure_syftbox_version(spec, quiet)?;
         let ver = detect_binary_version(&bin);
         return Ok((bin, ver));
     }
@@ -903,7 +907,7 @@ fn detect_binary_version(bin: &Path) -> Option<String> {
     parse_syftbox_version_output(&String::from_utf8_lossy(&out.stdout))
 }
 
-fn resolve_binary_for_env(config_path: &Path) -> Result<(PathBuf, Option<String>)> {
+fn resolve_binary_for_env(config_path: &Path, quiet: bool) -> Result<(PathBuf, Option<String>)> {
     // Load config to get email for key generation
     let config = load_config(config_path)?;
 
@@ -915,7 +919,7 @@ fn resolve_binary_for_env(config_path: &Path) -> Result<(PathBuf, Option<String>
     if let Some(info) = entry {
         if let Some(ver) = &info.binary_version {
             if Version::parse(ver).is_ok() {
-                let bin = ensure_syftbox_version(ver)?;
+                let bin = ensure_syftbox_version(ver, quiet)?;
                 let v = detect_binary_version(&bin).or_else(|| Some(ver.clone()));
                 return Ok((bin, v));
             }
@@ -928,7 +932,7 @@ fn resolve_binary_for_env(config_path: &Path) -> Result<(PathBuf, Option<String>
     // Fallback to global default
     let gc = load_global_config();
     if let Some(spec) = gc.default_binary {
-        return resolve_or_install_syftbox(&spec);
+        return resolve_or_install_syftbox(&spec, quiet);
     }
     // Fallback to PATH
     if let Some(p) = which_syftbox() {
@@ -945,7 +949,7 @@ fn ensure_env_has_binary(env_dir: &Path, email: &str) -> Result<()> {
         if info.binary.is_none() && info.binary_version.is_none() {
             let gc = load_global_config();
             if let Some(spec) = gc.default_binary {
-                let (p, v) = resolve_or_install_syftbox(&spec)?;
+                let (p, v) = resolve_or_install_syftbox(&spec, false)?;
                 info.binary = Some(p.to_string_lossy().to_string());
                 info.binary_version = v.clone();
                 let d = detect_binary_details(&p);
@@ -1096,7 +1100,7 @@ fn init_environment_with_binary(
     // Resolve and persist binary preference
     if let Some(bin_spec) = binary_to_use {
         println!("📦 Setting up SyftBox binary...");
-        let (bin_path, bin_ver) = resolve_or_install_syftbox(&bin_spec)?;
+        let (bin_path, bin_ver) = resolve_or_install_syftbox(&bin_spec, false)?;
         println!("✅ SyftBox binary configured successfully!");
         // Update registry entry
         let mut registry = load_registry()?;
@@ -1131,7 +1135,7 @@ fn init_environment_with_binary(
     println!("📁 Data dir: {}", current_dir.display().to_string().cyan());
     println!("🔌 Client port: {}", port.to_string().cyan());
     // Show resolved binary information
-    if let Ok((bin_path, bin_ver)) = resolve_binary_for_env(&config_path) {
+    if let Ok((bin_path, bin_ver)) = resolve_binary_for_env(&config_path, false) {
         println!("🛠 Binary: {}", bin_path.display().to_string().cyan());
         if let Some(v) = bin_ver {
             println!("🔢 Version: {}", v.cyan());
@@ -1189,7 +1193,7 @@ fn show_info() -> Result<()> {
     );
 
     // Show binary details resolved for this environment
-    if let Ok((bin_path, bin_ver)) = resolve_binary_for_env(&config_path) {
+    if let Ok((bin_path, bin_ver)) = resolve_binary_for_env(&config_path, false) {
         println!("🛠 Binary: {}", bin_path.display().to_string().cyan());
         if let Some(v) = bin_ver {
             println!("🔢 Version: {}", v.cyan());
@@ -1305,7 +1309,7 @@ fn activate_environment(quiet: bool) -> Result<()> {
     }
     // Resolve syftbox binary + version for this env (fallback to 'syftbox')
     let (bin_path, bin_ver) =
-        resolve_binary_for_env(&config_path).unwrap_or((PathBuf::from("syftbox"), None));
+        resolve_binary_for_env(&config_path, quiet).unwrap_or((PathBuf::from("syftbox"), None));
     println!("export SYFTBOX_BINARY=\"{}\"", bin_path.display());
     if let Some(v) = bin_ver {
         println!("export SYFTBOX_VERSION=\"{}\"", v);
@@ -1513,7 +1517,7 @@ fn activate_environment_to_file(path: &Path) -> Result<()> {
         script.push_str(&format!("export SYFTBOX_CLIENT_URL=\"{}\"\n", url));
     }
     let (bin_path, bin_ver) =
-        resolve_binary_for_env(&config_path).unwrap_or((PathBuf::from("syftbox"), None));
+        resolve_binary_for_env(&config_path, false).unwrap_or((PathBuf::from("syftbox"), None));
     script.push_str(&format!(
         "export SYFTBOX_BINARY=\"{}\"\n",
         bin_path.display()
@@ -2020,7 +2024,7 @@ fn prompt_and_login(config_path: &Path) -> Result<()> {
     let original_config = load_config(config_path)?;
 
     println!("Logging in to SyftBox...");
-    let (bin, _) = resolve_binary_for_env(config_path)?;
+    let (bin, _) = resolve_binary_for_env(config_path, false)?;
     let mut cmd = Command::new(bin);
     let status = cmd
         .args(["-c", config_path.to_str().unwrap(), "login"])
@@ -2243,7 +2247,7 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
     }
 
     // Background execution using nohup for both modes; write output to log file
-    let (bin, _) = resolve_binary_for_env(&config_path)?;
+    let (bin, _) = resolve_binary_for_env(&config_path, false)?;
     let mut nohup = Command::new("nohup");
     let child = nohup
         .arg(bin.to_str().unwrap())
@@ -2611,7 +2615,7 @@ fn login_to_syftbox() -> Result<()> {
     println!("  Config: {}", config_path.display().to_string().cyan());
     println!();
 
-    let (bin, _) = resolve_binary_for_env(&config_path)?;
+    let (bin, _) = resolve_binary_for_env(&config_path, false)?;
     let mut cmd = Command::new(bin);
     let status = cmd
         .args(["-c", config_path.to_str().unwrap(), "login"])
@@ -3050,7 +3054,7 @@ fn main() -> Result<()> {
                 let config = load_config(&config_path)?;
                 let env_dir = config_path.parent().unwrap().parent().unwrap();
                 let env_key = generate_env_key(env_dir, &config.email);
-                let (p, v) = resolve_or_install_syftbox(&bin_spec)?;
+                let (p, v) = resolve_or_install_syftbox(&bin_spec, false)?;
                 let mut registry = load_registry()?;
                 if let Some(info) = registry.environments.get_mut(&env_key) {
                     info.binary = Some(p.to_string_lossy().to_string());
