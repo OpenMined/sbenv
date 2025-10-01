@@ -167,6 +167,14 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+    /// Execute a command within an sbenv environment
+    Exec {
+        /// Email address of the environment to use
+        email: String,
+        /// Command and arguments to execute
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 fn get_registry_path() -> PathBuf {
@@ -1361,12 +1369,24 @@ fn activate_environment(quiet: bool) -> Result<()> {
     println!("    # Bash - detect if using PROMPT_COMMAND (modern prompt frameworks)");
     println!("    if [ -n \"$PROMPT_COMMAND\" ]; then");
     println!("        # Using a prompt framework like Starship, Oh My Bash, etc.");
-    println!("        export SYFTBOX_OLD_PROMPT_COMMAND=\"$PROMPT_COMMAND\"");
-    println!("        export PROMPT_COMMAND='echo -ne \"\\033[0m📦 (${{SYFTBOX_ENV_NAME}}) \"; '\"$PROMPT_COMMAND\"");
+    println!("        # Only add decorator if not already active");
+    println!("        if [ -z \"$SYFTBOX_OLD_PROMPT_COMMAND\" ]; then");
+    println!("            export SYFTBOX_OLD_PROMPT_COMMAND=\"$PROMPT_COMMAND\"");
+    println!("            # Create a function to show the decorator");
+    println!("            _sbenv_prompt_decorator() {{");
+    println!("                if [ -n \"$SYFTBOX_ENV_NAME\" ]; then");
+    println!("                    printf '\\033[0m📦 (%s) ' \"$SYFTBOX_ENV_NAME\"");
+    println!("                fi");
+    println!("            }}");
+    println!("            export -f _sbenv_prompt_decorator");
+    println!("            export PROMPT_COMMAND='_sbenv_prompt_decorator; '\"$PROMPT_COMMAND\"");
+    println!("        fi");
     println!("    else");
     println!("        # Traditional bash prompt");
-    println!("        export SYFTBOX_OLD_PS1=\"$PS1\"");
-    println!("        export PS1=\"\\[\\033[0m\\]📦 (${{SYFTBOX_ENV_NAME}}) ${{PS1}}\"");
+    println!("        if [ -z \"$SYFTBOX_OLD_PS1\" ]; then");
+    println!("            export SYFTBOX_OLD_PS1=\"$PS1\"");
+    println!("            export PS1=\"\\[\\033[0m\\]📦 (${{SYFTBOX_ENV_NAME}}) ${{PS1}}\"");
+    println!("        fi");
     println!("    fi");
     println!("fi");
 
@@ -1431,6 +1451,10 @@ fn deactivate_environment(quiet: bool) -> Result<()> {
     println!("if [ -n \"$SYFTBOX_OLD_PROMPT_COMMAND\" ]; then");
     println!("    export PROMPT_COMMAND=\"$SYFTBOX_OLD_PROMPT_COMMAND\"");
     println!("    unset SYFTBOX_OLD_PROMPT_COMMAND");
+    println!("    # Remove the decorator function if it exists");
+    println!("    if declare -f _sbenv_prompt_decorator >/dev/null 2>&1; then");
+    println!("        unset -f _sbenv_prompt_decorator");
+    println!("    fi");
     println!("elif [ -n \"$SYFTBOX_OLD_PS1\" ]; then");
     println!("    export PS1=\"$SYFTBOX_OLD_PS1\"");
     println!("    unset SYFTBOX_OLD_PS1");
@@ -2741,6 +2765,69 @@ fn list_environments() -> Result<()> {
     Ok(())
 }
 
+fn exec_in_environment(email: &str, command: &[String]) -> Result<()> {
+    if command.is_empty() {
+        return Err(anyhow::anyhow!("No command specified"));
+    }
+
+    // Load registry to find the environment
+    let registry = load_registry()?;
+    let env_info = registry.environments.get(email).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Environment for '{}' not found. Run 'sbenv list' to see available environments.",
+            email
+        )
+    })?;
+
+    let env_path = Path::new(&env_info.path);
+    let config_path = env_path.join(".syftbox").join("config.json");
+
+    if !config_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Environment config not found at {:?}",
+            config_path
+        ));
+    }
+
+    // Load the config to get environment variables
+    let config = load_config(&config_path)?;
+
+    // Build the command - it inherits parent environment by default
+    let mut cmd = Command::new(&command[0]);
+    if command.len() > 1 {
+        cmd.args(&command[1..]);
+    }
+
+    // Add/override environment variables for sbenv
+    cmd.env("SYFTBOX_EMAIL", &config.email);
+    cmd.env("SYFTBOX_DATA_DIR", &config.data_dir);
+    cmd.env("SYFTBOX_SERVER_URL", &config.server_url);
+    cmd.env(
+        "SYFTBOX_CONFIG_PATH",
+        config_path.to_string_lossy().as_ref(),
+    );
+    if let Some(url) = &config.client_url {
+        cmd.env("SYFTBOX_CLIENT_URL", url);
+    }
+    cmd.env("SYFTBOX_ENV_NAME", email);
+    cmd.env("SYFTBOX_ENV_ACTIVE", "1");
+
+    // Set the working directory to the environment directory
+    cmd.current_dir(env_path);
+
+    // Execute the command and wait for it to complete
+    let status = cmd
+        .status()
+        .with_context(|| format!("Failed to execute command: {}", command[0]))?;
+
+    // Exit with the same code as the command
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
 fn update_environment(server_url: Option<String>, dev: Option<bool>) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let config_path = find_syftbox_config(&current_dir).ok_or_else(|| {
@@ -3113,6 +3200,9 @@ fn main() -> Result<()> {
         }
         Some(Commands::Update { force }) => {
             self_update_sbenv(*force)?;
+        }
+        Some(Commands::Exec { email, command }) => {
+            exec_in_environment(email, command)?;
         }
         None => {
             if env::var("SYFTBOX_ENV_ACTIVE").is_ok() {
