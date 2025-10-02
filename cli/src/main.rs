@@ -3808,6 +3808,160 @@ mod tests {
     }
 
     #[test]
+    fn test_get_shell_config_file_respects_shell() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+
+        let original_shell = set_env_var("SHELL", "/bin/zsh");
+        let zsh_config = get_shell_config_file().unwrap();
+        assert_eq!(zsh_config, temp_dir.path().join(".zshrc"));
+
+        set_env_var("SHELL", "/bin/fish");
+        let fish_config = get_shell_config_file().unwrap();
+        assert_eq!(
+            fish_config,
+            temp_dir.path().join(".config/fish/config.fish")
+        );
+
+        set_env_var("SHELL", "/bin/bash");
+        let bash_config = get_shell_config_file().unwrap();
+        assert_eq!(bash_config, temp_dir.path().join(".bashrc"));
+
+        restore_env_var("SHELL", original_shell);
+        restore_home(original_home);
+    }
+
+    #[test]
+    fn test_check_shell_functions_installed_detects_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let rc_path = temp_dir.path().join("rc");
+
+        assert!(!check_shell_functions_installed(&rc_path).unwrap());
+        fs::write(&rc_path, "# SyftBox environment functions\n").unwrap();
+        assert!(check_shell_functions_installed(&rc_path).unwrap());
+    }
+
+    #[test]
+    fn test_check_auto_activation_installed_detects_hook() {
+        let temp_dir = TempDir::new().unwrap();
+        let rc_path = temp_dir.path().join("rc");
+
+        assert!(!check_auto_activation_installed(&rc_path).unwrap());
+        fs::write(&rc_path, "_sbenv_auto_hook\n").unwrap();
+        assert!(check_auto_activation_installed(&rc_path).unwrap());
+    }
+
+    #[test]
+    fn test_activate_environment_to_file_writes_script() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+        let original_dir = env::current_dir().unwrap();
+
+        let env_root = temp_dir.path().join("workspace");
+        let syftbox_dir = env_root.join(".syftbox");
+        fs::create_dir_all(&syftbox_dir).unwrap();
+        let config_path = syftbox_dir.join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+            "data_dir": "workspace/data",
+            "email": "user@example.com",
+            "server_url": "https://server",
+            "client_url": "http://127.0.0.1:7990",
+            "dev_mode": false
+        }"#,
+        )
+        .unwrap();
+
+        let fake_bin = create_fake_syftbox(&temp_dir.path().join("bin"), "20.0.0");
+        let mut registry = EnvRegistry {
+            environments: HashMap::new(),
+        };
+        let key = generate_env_key(&env_root, "user@example.com");
+        registry.environments.insert(
+            key,
+            EnvInfo {
+                path: env_root.to_string_lossy().to_string(),
+                email: "user@example.com".to_string(),
+                port: 7990,
+                name: "workspace".to_string(),
+                server_url: "https://server".to_string(),
+                dev_mode: false,
+                binary: Some(fake_bin.to_string_lossy().to_string()),
+                binary_version: None,
+                binary_hash: None,
+                binary_os: None,
+                binary_arch: None,
+            },
+        );
+        save_registry(&registry).unwrap();
+
+        env::set_current_dir(&env_root).unwrap();
+        let output_path = temp_dir.path().join("activate.sh");
+        activate_environment_to_file(&output_path).unwrap();
+
+        let script = fs::read_to_string(&output_path).unwrap();
+        assert!(script.contains("export SYFTBOX_EMAIL=\"user@example.com\""));
+        assert!(script.contains("export SYFTBOX_BINARY"));
+        assert!(script.contains("export SYFTBOX_ENV_NAME=\"data\""));
+
+        env::set_current_dir(&original_dir).unwrap();
+        restore_home(original_home);
+    }
+
+    #[test]
+    fn test_list_environments_handles_entries() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+
+        let env_root = temp_dir.path().join("env_list");
+        fs::create_dir_all(env_root.join(".syftbox")).unwrap();
+
+        let mut registry = EnvRegistry {
+            environments: HashMap::new(),
+        };
+        registry.environments.insert(
+            "env".to_string(),
+            EnvInfo {
+                path: env_root.to_string_lossy().to_string(),
+                email: "env@example.com".to_string(),
+                port: 7939,
+                name: "env".to_string(),
+                server_url: "https://server".to_string(),
+                dev_mode: false,
+                binary: None,
+                binary_version: None,
+                binary_hash: None,
+                binary_os: None,
+                binary_arch: None,
+            },
+        );
+        save_registry(&registry).unwrap();
+
+        list_environments().unwrap();
+
+        restore_home(original_home);
+    }
+
+    #[test]
+    fn test_list_environments_handles_empty_registry() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+
+        save_registry(&EnvRegistry {
+            environments: HashMap::new(),
+        })
+        .unwrap();
+        list_environments().unwrap();
+
+        restore_home(original_home);
+    }
+
+    #[test]
     fn test_ensure_marker_exists_uses_config_port_and_registry_binary() {
         let _guard = HOME_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
