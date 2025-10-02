@@ -3732,6 +3732,131 @@ mod tests {
     }
 
     #[test]
+    fn test_check_login_status_reflects_refresh_token_presence() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+            "data_dir": "/tmp/data",
+            "email": "user@example.com",
+            "server_url": "https://server",
+            "refresh_token": "token-123"
+        }"#,
+        )
+        .unwrap();
+
+        assert!(check_login_status(&config_path).unwrap());
+
+        fs::write(
+            &config_path,
+            r#"{
+            "data_dir": "/tmp/data",
+            "email": "user@example.com",
+            "server_url": "https://server"
+        }"#,
+        )
+        .unwrap();
+
+        assert!(!check_login_status(&config_path).unwrap());
+    }
+
+    #[test]
+    fn test_restore_config_after_login_restores_original_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let original_config = SyftBoxConfig {
+            data_dir: "/orig/data".to_string(),
+            email: "orig@example.com".to_string(),
+            server_url: "https://orig".to_string(),
+            client_url: Some("http://127.0.0.1:9000".to_string()),
+            client_token: None,
+            refresh_token: None,
+            dev_mode: true,
+        };
+
+        let mutated = serde_json::json!({
+            "data_dir": "/mutated",
+            "email": "mutated@example.com",
+            "server_url": "https://mutated",
+            "client_url": "http://127.0.0.1:7999",
+            "refresh_token": "new-token",
+            "dev_mode": false
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&mutated).unwrap(),
+        )
+        .unwrap();
+
+        restore_config_after_login(&config_path, &original_config).unwrap();
+
+        let updated: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            updated["data_dir"].as_str(),
+            Some(original_config.data_dir.as_str())
+        );
+        assert_eq!(
+            updated["email"].as_str(),
+            Some(original_config.email.as_str())
+        );
+        assert_eq!(
+            updated["server_url"].as_str(),
+            Some(original_config.server_url.as_str())
+        );
+        assert_eq!(
+            updated["client_url"].as_str(),
+            original_config.client_url.as_deref()
+        );
+        assert_eq!(
+            updated["dev_mode"].as_bool(),
+            Some(original_config.dev_mode)
+        );
+        assert_eq!(updated["refresh_token"].as_str(), Some("new-token"));
+    }
+
+    #[test]
+    fn test_restore_config_after_login_drops_client_url_when_absent() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let original_config = SyftBoxConfig {
+            data_dir: "/orig/data".to_string(),
+            email: "orig@example.com".to_string(),
+            server_url: "https://orig".to_string(),
+            client_url: None,
+            client_token: None,
+            refresh_token: None,
+            dev_mode: false,
+        };
+
+        let mutated = serde_json::json!({
+            "data_dir": "/mutated",
+            "email": "mutated@example.com",
+            "server_url": "https://mutated",
+            "client_url": "http://127.0.0.1:7999",
+            "refresh_token": "new-token",
+            "dev_mode": true
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&mutated).unwrap(),
+        )
+        .unwrap();
+
+        restore_config_after_login(&config_path, &original_config).unwrap();
+
+        let updated: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(updated.get("client_url").is_none());
+        assert_eq!(updated["refresh_token"].as_str(), Some("new-token"));
+        assert_eq!(
+            updated["dev_mode"].as_bool(),
+            Some(original_config.dev_mode)
+        );
+    }
+
+    #[test]
     fn test_get_registry_and_global_paths_use_home() {
         let _guard = HOME_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
