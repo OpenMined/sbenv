@@ -3465,6 +3465,60 @@ mod tests {
     }
 
     #[test]
+    fn test_register_environment_preserves_binary_info() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+
+        let env_path = temp_dir.path().join("env");
+        fs::create_dir_all(&env_path).unwrap();
+        let key = generate_env_key(&env_path, "user@example.com");
+
+        let mut initial_registry = EnvRegistry {
+            environments: HashMap::new(),
+        };
+        initial_registry.environments.insert(
+            key.clone(),
+            EnvInfo {
+                path: env_path.to_string_lossy().to_string(),
+                email: "user@example.com".to_string(),
+                port: 7950,
+                name: "env".to_string(),
+                server_url: "https://server".to_string(),
+                dev_mode: false,
+                binary: Some("/opt/syftbox".to_string()),
+                binary_version: Some("1.2.3".to_string()),
+                binary_hash: Some("hash".to_string()),
+                binary_os: Some("linux".to_string()),
+                binary_arch: Some("x86_64".to_string()),
+            },
+        );
+        save_registry(&initial_registry).unwrap();
+
+        let config = SyftBoxConfig {
+            data_dir: env_path.join("data").to_string_lossy().to_string(),
+            email: "user@example.com".to_string(),
+            server_url: "https://new".to_string(),
+            client_url: Some("http://127.0.0.1:7950".to_string()),
+            client_token: None,
+            refresh_token: None,
+            dev_mode: true,
+        };
+
+        register_environment(&env_path, &config).unwrap();
+
+        let updated = load_registry().unwrap();
+        let info = updated.environments.get(&key).unwrap();
+        assert_eq!(info.binary.as_deref(), Some("/opt/syftbox"));
+        assert_eq!(info.binary_version.as_deref(), Some("1.2.3"));
+        assert_eq!(info.binary_hash.as_deref(), Some("hash"));
+        assert_eq!(info.binary_os.as_deref(), Some("linux"));
+        assert_eq!(info.binary_arch.as_deref(), Some("x86_64"));
+
+        restore_home(original_home);
+    }
+
+    #[test]
     fn test_load_registry_creates_empty_if_not_exists() {
         let _guard = HOME_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -3738,6 +3792,22 @@ mod tests {
     }
 
     #[test]
+    fn test_load_global_config_returns_default_on_invalid_json() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+
+        let cfg_path = get_global_config_path();
+        fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        fs::write(&cfg_path, "not-json").unwrap();
+
+        let loaded = load_global_config();
+        assert!(loaded.default_binary.is_none());
+
+        restore_home(original_home);
+    }
+
+    #[test]
     fn test_ensure_marker_exists_uses_config_port_and_registry_binary() {
         let _guard = HOME_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -3847,6 +3917,38 @@ mod tests {
         let json: Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(json["port"], 7970);
         assert_eq!(json.get("binary"), None);
+
+        restore_home(original_home);
+    }
+
+    #[test]
+    fn test_ensure_marker_exists_defaults_port_to_zero() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+
+        let env_root = temp_dir.path().join("env_default");
+        let syftbox_dir = env_root.join(".syftbox");
+        fs::create_dir_all(&syftbox_dir).unwrap();
+        let config_path = syftbox_dir.join("config.json");
+        fs::write(&config_path, "{}").unwrap();
+
+        let config = SyftBoxConfig {
+            data_dir: env_root.join("data").to_string_lossy().to_string(),
+            email: "default@example.com".to_string(),
+            server_url: "https://server".to_string(),
+            client_url: None,
+            client_token: None,
+            refresh_token: None,
+            dev_mode: false,
+        };
+
+        ensure_marker_exists(&config_path, &config).unwrap();
+        let marker_path = env_root.join(".sbenv");
+        let contents = fs::read_to_string(marker_path).unwrap();
+        let json: Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(json["port"], 0);
+        assert!(json.get("binary").is_none());
 
         restore_home(original_home);
     }
@@ -3993,6 +4095,19 @@ mod tests {
     }
 
     #[test]
+    fn test_current_os_arch_matches_platform() {
+        let (os, arch) = current_os_arch();
+        match std::env::consts::OS {
+            "macos" => assert_eq!(os, "darwin"),
+            other => assert_eq!(os, other),
+        }
+        match std::env::consts::ARCH {
+            "aarch64" => assert_eq!(arch, "arm64"),
+            other => assert_eq!(arch, other),
+        }
+    }
+
+    #[test]
     fn test_install_syftbox_from_download_handles_plain_binary() {
         let _guard = HOME_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -4092,6 +4207,206 @@ mod tests {
         assert!(err.to_string().contains("Failed"));
 
         restore_path(original_path);
+    }
+
+    #[test]
+    fn test_find_syftbox_config_returns_none_when_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir.path().join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(find_syftbox_config(&nested).is_none());
+    }
+
+    #[test]
+    fn test_find_in_dir_returns_none_for_absent_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir_all(temp_dir.path().join("sub")).unwrap();
+        assert!(find_in_dir(temp_dir.path(), "missing").is_none());
+    }
+
+    #[test]
+    fn test_ensure_env_has_binary_uses_path_fallback() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+        let cmd_dir = temp_dir.path().join("cmd");
+        let env_root = temp_dir.path().join("env_path");
+        fs::create_dir_all(&env_root).unwrap();
+        let fake_bin = create_fake_syftbox(&temp_dir.path().join("bin"), "12.0.0");
+
+        let script = if cfg!(windows) {
+            format!("@echo off\r\necho {}\r\n", fake_bin.display())
+        } else {
+            format!("#!/bin/sh\nprintf '%s\\n' \"{}\"\n", fake_bin.display())
+        };
+        write_fake_command(&cmd_dir, "which", &script);
+        let original_path = set_temp_path(&cmd_dir);
+
+        save_global_config(&GlobalConfig::default()).unwrap();
+
+        let mut registry = EnvRegistry {
+            environments: HashMap::new(),
+        };
+        let email = "path@example.com";
+        let key = generate_env_key(&env_root, email);
+        registry.environments.insert(
+            key.clone(),
+            EnvInfo {
+                path: env_root.to_string_lossy().to_string(),
+                email: email.to_string(),
+                port: 7955,
+                name: "env_path".to_string(),
+                server_url: "https://server".to_string(),
+                dev_mode: false,
+                binary: None,
+                binary_version: None,
+                binary_hash: None,
+                binary_os: None,
+                binary_arch: None,
+            },
+        );
+        save_registry(&registry).unwrap();
+
+        ensure_env_has_binary(&env_root, email).unwrap();
+
+        let updated = load_registry().unwrap();
+        let info = updated.environments.get(&key).unwrap();
+        assert_eq!(
+            std::path::Path::new(info.binary.as_ref().unwrap()),
+            fake_bin
+        );
+        assert_eq!(info.binary_version.as_deref(), Some("12.0.0"));
+        assert!(info.binary_hash.is_some());
+        assert!(info.binary_os.is_some());
+        assert!(info.binary_arch.is_some());
+
+        restore_path(original_path);
+        restore_home(original_home);
+    }
+
+    #[test]
+    fn test_ensure_syftbox_version_downloads_plain_candidate() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+        let cmd_dir = temp_dir.path().join("cmd");
+        fs::create_dir_all(&cmd_dir).unwrap();
+
+        let download_src = create_fake_syftbox(&temp_dir.path().join("download_src"), "13.0.0");
+        let curl_body = if cfg!(windows) {
+            r#"@echo off
+setlocal enabledelayedexpansion
+if "%1"=="-sL" (
+  echo {"assets":[]}
+  exit /b 0
+)
+set "out="
+set "url="
+:loop
+if "%1"=="" goto done
+if "%1"=="-o" (
+  shift
+  set "out=%~1"
+) else (
+  set "url=%~1"
+)
+shift
+goto loop
+:done
+if defined url (
+  echo %url% | findstr /R ".tar.gz$" >nul && exit /b 1
+  echo %url% | findstr /R ".tgz$" >nul && exit /b 1
+  echo %url% | findstr /R ".zip$" >nul && exit /b 1
+)
+copy "%SBENV_DOWNLOAD_BIN%" "%out%" >nul
+exit /b 0
+"#
+        } else {
+            r#"#!/bin/sh
+if [ "$1" = "-sL" ]; then
+  printf '%s\n' '{"assets":[]}'
+  exit 0
+fi
+out=""
+url=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    shift
+    out="$1"
+  fi
+  url="$1"
+  shift
+done
+case "$url" in
+  *.tar.gz|*.tgz|*.zip)
+    exit 1
+    ;;
+  *)
+    cp "$SBENV_DOWNLOAD_BIN" "$out"
+    exit 0
+    ;;
+esac
+"#
+        };
+        write_fake_command(&cmd_dir, "curl", curl_body);
+        let original_path = set_temp_path(&cmd_dir);
+        let original_download = set_env_var(
+            "SBENV_DOWNLOAD_BIN",
+            download_src.to_string_lossy().as_ref(),
+        );
+
+        let bin_path = ensure_syftbox_version("13.0.0", true).unwrap();
+        assert!(bin_path.exists());
+        assert!(bin_path.starts_with(get_binaries_dir()));
+        let details = detect_binary_details(&bin_path);
+        assert_eq!(details.version.as_deref(), Some("13.0.0"));
+
+        restore_env_var("SBENV_DOWNLOAD_BIN", original_download);
+        restore_path(original_path);
+        restore_home(original_home);
+    }
+
+    #[test]
+    fn test_ensure_syftbox_version_prefers_github_asset() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+        let cmd_dir = temp_dir.path().join("cmd");
+        fs::create_dir_all(&cmd_dir).unwrap();
+
+        let fake_bin = create_fake_syftbox(&temp_dir.path().join("fake"), "14.1.0");
+        let archive_path = temp_dir.path().join("archive.tar.gz");
+        fs::write(&archive_path, b"tar").unwrap();
+
+        let curl_body = if cfg!(windows) {
+            "@echo off\r\nset arg1=%1\r\nif \"%arg1%\"==\"-sL\" (\r\n  echo {\"assets\":[{\"name\":\"syftbox-14.1.0-darwin-arm64.tar.gz\",\"browser_download_url\":\"https://example.com/syftbox.tar.gz\"}]}\r\n  exit /b 0\r\n)\r\nset out=\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif \"%1\"==\"-o\" (\r\n  shift\r\n  set out=%1\r\n)\r\nshift\r\ngoto loop\r\n:done\r\ncopy \"%SBENV_DOWNLOAD_ARCHIVE%\" \"%out%\" >nul\r\nexit /b 0\r\n"
+        } else {
+            "#!/bin/sh\nif [ \"$1\" = \"-sL\" ]; then\n  printf '%s\\n' '{\"assets\":[{\"name\":\"syftbox-14.1.0-darwin-arm64.tar.gz\",\"browser_download_url\":\"https://example.com/syftbox.tar.gz\"}]}'\n  exit 0\nfi\nout=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then\n    shift\n    out=\"$1\"\n  fi\n  shift\ndone\ncp \"$SBENV_DOWNLOAD_ARCHIVE\" \"$out\"\nexit 0\n"
+        };
+        let tar_body = if cfg!(windows) {
+            "@echo off\r\ncopy \"%SBENV_FAKE_BIN%\" \"%4\\syftbox\" >nul\r\nexit /b 0\r\n"
+        } else {
+            "#!/bin/sh\ncp \"$SBENV_FAKE_BIN\" \"$4/syftbox\"\n"
+        };
+
+        write_fake_command(&cmd_dir, "curl", curl_body);
+        write_fake_command(&cmd_dir, "tar", tar_body);
+        let original_path = set_temp_path(&cmd_dir);
+        let original_archive = set_env_var(
+            "SBENV_DOWNLOAD_ARCHIVE",
+            archive_path.to_string_lossy().as_ref(),
+        );
+        let original_fake = set_env_var("SBENV_FAKE_BIN", fake_bin.to_string_lossy().as_ref());
+
+        let path = ensure_syftbox_version("14.1.0", true).unwrap();
+        assert!(path.exists());
+        let details = detect_binary_details(&path);
+        assert_eq!(details.version.as_deref(), Some("14.1.0"));
+
+        restore_env_var("SBENV_FAKE_BIN", original_fake);
+        restore_env_var("SBENV_DOWNLOAD_ARCHIVE", original_archive);
+        restore_path(original_path);
+        restore_home(original_home);
     }
 
     #[test]
@@ -4344,6 +4659,53 @@ mod tests {
         let (path, version) = resolve_binary_for_env(&config_path, true).unwrap();
         assert_eq!(path, cached);
         assert_eq!(version.as_deref(), Some("6.6.6"));
+
+        restore_home(original_home);
+    }
+
+    #[test]
+    fn test_resolve_binary_for_env_uses_registry_binary_path() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let original_home = set_temp_home(&temp_dir);
+
+        let env_root = temp_dir.path().join("env_with_binary");
+        fs::create_dir_all(&env_root).unwrap();
+        let syftbox_dir = env_root.join(".syftbox");
+        fs::create_dir_all(&syftbox_dir).unwrap();
+        let config_path = syftbox_dir.join("config.json");
+        fs::write(
+            &config_path,
+            r#"{"email":"user@example.com","data_dir":"/tmp","server_url":"https://server"}"#,
+        )
+        .unwrap();
+
+        let fake_bin = create_fake_syftbox(&temp_dir.path().join("bin"), "15.0.0");
+
+        let mut registry = EnvRegistry {
+            environments: HashMap::new(),
+        };
+        registry.environments.insert(
+            generate_env_key(&env_root, "user@example.com"),
+            EnvInfo {
+                path: env_root.to_string_lossy().to_string(),
+                email: "user@example.com".to_string(),
+                port: 7942,
+                name: "env".to_string(),
+                server_url: "https://server".to_string(),
+                dev_mode: false,
+                binary: Some(fake_bin.to_string_lossy().to_string()),
+                binary_version: None,
+                binary_hash: None,
+                binary_os: None,
+                binary_arch: None,
+            },
+        );
+        save_registry(&registry).unwrap();
+
+        let (path, version) = resolve_binary_for_env(&config_path, true).unwrap();
+        assert_eq!(path, fake_bin);
+        assert_eq!(version.as_deref(), Some("15.0.0"));
 
         restore_home(original_home);
     }
