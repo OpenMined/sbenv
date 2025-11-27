@@ -285,7 +285,14 @@ fn register_environment(path: &Path, config: &SyftBoxConfig) -> Result<()> {
         server_url: config.server_url.clone(),
         dev_mode: config.dev_mode,
         binary: existing.as_ref().and_then(|e| e.binary.clone()),
-        binary_version: existing.as_ref().and_then(|e| e.binary_version.clone()),
+        // If a concrete binary path exists, prefer it and drop stale versions to avoid downloads
+        binary_version: existing.as_ref().and_then(|e| {
+            if e.binary.is_some() {
+                None
+            } else {
+                e.binary_version.clone()
+            }
+        }),
         binary_hash: existing.as_ref().and_then(|e| e.binary_hash.clone()),
         binary_os: existing.as_ref().and_then(|e| e.binary_os.clone()),
         binary_arch: existing.as_ref().and_then(|e| e.binary_arch.clone()),
@@ -915,6 +922,10 @@ fn detect_binary_version(bin: &Path) -> Option<String> {
     parse_syftbox_version_output(&String::from_utf8_lossy(&out.stdout))
 }
 
+fn is_semver_spec(spec: &str) -> bool {
+    Version::parse(spec).is_ok()
+}
+
 fn resolve_binary_for_env(config_path: &Path, quiet: bool) -> Result<(PathBuf, Option<String>)> {
     // Load config to get email for key generation
     let config = load_config(config_path)?;
@@ -925,16 +936,18 @@ fn resolve_binary_for_env(config_path: &Path, quiet: bool) -> Result<(PathBuf, O
     let env_key = generate_env_key(env_dir, &config.email);
     let entry = registry.environments.get(&env_key);
     if let Some(info) = entry {
+        if let Some(b) = &info.binary {
+            let p = PathBuf::from(b);
+            if p.exists() {
+                return Ok((p.clone(), detect_binary_version(&p)));
+            }
+        }
         if let Some(ver) = &info.binary_version {
-            if Version::parse(ver).is_ok() {
+            if is_semver_spec(ver) {
                 let bin = ensure_syftbox_version(ver, quiet)?;
                 let v = detect_binary_version(&bin).or_else(|| Some(ver.clone()));
                 return Ok((bin, v));
             }
-        }
-        if let Some(b) = &info.binary {
-            let p = PathBuf::from(b);
-            return Ok((p.clone(), detect_binary_version(&p)));
         }
     }
     // Fallback to global default
@@ -959,7 +972,11 @@ fn ensure_env_has_binary(env_dir: &Path, email: &str) -> Result<()> {
             if let Some(spec) = gc.default_binary {
                 let (p, v) = resolve_or_install_syftbox(&spec, false)?;
                 info.binary = Some(p.to_string_lossy().to_string());
-                info.binary_version = v.clone();
+                info.binary_version = if is_semver_spec(&spec) {
+                    v.clone()
+                } else {
+                    None
+                };
                 let d = detect_binary_details(&p);
                 info.binary_hash = d.hash;
                 info.binary_os = d.os;
@@ -1115,7 +1132,12 @@ fn init_environment_with_binary(
         let env_key = generate_env_key(&current_dir, &email);
         if let Some(info) = registry.environments.get_mut(&env_key) {
             info.binary = Some(bin_path.to_string_lossy().to_string());
-            info.binary_version = bin_ver;
+            // Only persist a version when the user provided a semantic version spec
+            info.binary_version = if is_semver_spec(&bin_spec) {
+                bin_ver
+            } else {
+                None
+            };
             let d = detect_binary_details(&bin_path);
             info.binary_hash = d.hash;
             info.binary_os = d.os;
@@ -3145,7 +3167,11 @@ fn main() -> Result<()> {
                 let mut registry = load_registry()?;
                 if let Some(info) = registry.environments.get_mut(&env_key) {
                     info.binary = Some(p.to_string_lossy().to_string());
-                    info.binary_version = v.clone();
+                    info.binary_version = if is_semver_spec(&bin_spec) {
+                        v.clone()
+                    } else {
+                        None
+                    };
                 }
                 save_registry(&registry)?;
                 let mut gc = load_global_config();
