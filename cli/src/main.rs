@@ -138,8 +138,8 @@ enum Commands {
         /// Skip login check
         #[arg(long)]
         skip_login_check: bool,
-        /// Run syftbox in daemon mode (background). By default off; process is still backgrounded.
-        #[arg(long, default_value_t = false)]
+        /// Run syftbox in daemon mode with control plane HTTP API. Default: on.
+        #[arg(long, default_value_t = true)]
         daemon: bool,
     },
     /// Stop the running SyftBox daemon
@@ -247,6 +247,13 @@ fn find_available_port() -> Result<u16> {
     }
 
     Err(anyhow::anyhow!("No available ports in range 7939-7999"))
+}
+
+/// Generate a random 32-character hex token for the control plane API
+fn generate_client_token() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 16] = rng.gen();
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn generate_env_key(path: &Path, email: &str) -> String {
@@ -1062,12 +1069,15 @@ fn init_environment_with_binary(
         }
     };
 
+    // Generate a random token for the control plane API
+    let client_token = generate_client_token();
+
     let config = SyftBoxConfig {
         data_dir: current_dir.to_string_lossy().to_string(),
         email: email.clone(),
         server_url: resolved_server_url.clone(),
         client_url: Some(client_url.clone()),
-        client_token: None,
+        client_token: Some(client_token.clone()),
         refresh_token: None,
         dev_mode: dev,
     };
@@ -2224,6 +2234,12 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
             let http_addr_owned = url.strip_prefix("http://").unwrap_or(&url).to_string();
             syftbox_args.push("--http-addr".into());
             syftbox_args.push(http_addr_owned);
+        }
+
+        // Pass the client token if available
+        if let Some(token) = &config.client_token {
+            syftbox_args.push("--http-token".into());
+            syftbox_args.push(token.clone());
         }
     }
 
