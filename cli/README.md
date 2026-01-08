@@ -36,6 +36,7 @@ sbenv install-shell
 ```
 
 Note: If your shell doesn't look like this with nice text on the right, then open a PR to fix it:
+
 ```
 ~/datasites/me@madhavajay.com                                    ✔  📦 me@madhavajay.com
 ```
@@ -51,6 +52,7 @@ sbenv init
 This creates a new SyftBox environment in the current directory.
 
 #### Dev mode
+
 Dev mode sets SYFTBOX_AUTH_ENABLED=0 and defaults to localhost:8080.
 You can override that with the --server_url param.
 
@@ -61,6 +63,7 @@ sbenv init --server_url https://custom.server
 ```
 
 Notes:
+
 - With `--dev`, default `server_url` is `http://localhost:8080` (overridable).
 - Without `--dev`, default `server_url` is `https://syftbox.net`.
 - In dev mode, `sbenv start` and `sbenv login` run syftbox with `SYFTBOX_AUTH_ENABLED=0`.
@@ -78,6 +81,7 @@ sba
 ```
 
 Your prompt will change to show the active environment:
+
 ```
 ~/datasites/me@madhavajay.com                                    ✔  📦 me@madhavajay.com
 ```
@@ -145,7 +149,6 @@ sbenv stop
 # View SyftBox logs
 sbenv logs [--lines <n>] [--follow]
 ```
-
 
 ## Environment Structure
 
