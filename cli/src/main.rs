@@ -2055,14 +2055,11 @@ fn prompt_and_login(config_path: &Path) -> Result<()> {
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
         // Enable auth bypass only in dev mode
-        .envs(
-            if load_config(config_path)?.dev_mode {
-                Some(("SYFTBOX_AUTH_ENABLED", "0"))
-            } else {
-                None::<(&str, &str)>
-            }
-            .into_iter(),
-        )
+        .envs(if load_config(config_path)?.dev_mode {
+            Some(("SYFTBOX_AUTH_ENABLED", "0"))
+        } else {
+            None::<(&str, &str)>
+        })
         .status()?;
 
     if !status.success() {
@@ -2279,14 +2276,11 @@ fn start_daemon(force: bool, skip_login_check: bool, daemon: bool) -> Result<()>
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
         // Enable auth bypass only in dev mode
-        .envs(
-            if config.dev_mode {
-                Some(("SYFTBOX_AUTH_ENABLED", "0"))
-            } else {
-                None::<(&str, &str)>
-            }
-            .into_iter(),
-        )
+        .envs(if config.dev_mode {
+            Some(("SYFTBOX_AUTH_ENABLED", "0"))
+        } else {
+            None::<(&str, &str)>
+        })
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -2646,14 +2640,11 @@ fn login_to_syftbox() -> Result<()> {
         .env("SYFTBOX_CONFIG", config_path.to_str().unwrap())
         .env("SYFTBOX_CLIENT_CONFIG_PATH", config_path.to_str().unwrap())
         // Enable auth bypass only in dev mode
-        .envs(
-            if original_config.dev_mode {
-                Some(("SYFTBOX_AUTH_ENABLED", "0"))
-            } else {
-                None::<(&str, &str)>
-            }
-            .into_iter(),
-        )
+        .envs(if original_config.dev_mode {
+            Some(("SYFTBOX_AUTH_ENABLED", "0"))
+        } else {
+            None::<(&str, &str)>
+        })
         .status()
         .context("Failed to run syftbox login. Is 'syftbox' installed?")?;
 
@@ -2688,7 +2679,7 @@ fn list_environments() -> Result<()> {
 
     // Collect and sort by email (case-insensitive)
     let mut envs: Vec<&EnvInfo> = registry.environments.values().collect();
-    envs.sort_by(|a, b| a.email.to_lowercase().cmp(&b.email.to_lowercase()));
+    envs.sort_by_key(|a| a.email.to_lowercase());
 
     for info in envs {
         let path = Path::new(&info.path);
